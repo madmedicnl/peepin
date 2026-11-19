@@ -1,0 +1,24 @@
+[package]
+name = "peepin"
+version = "0.1.0"
+edition = "2024"
+description = "A tiny transparent image and video viewer with a terminal feel"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+image = "0.25"
+image_dds = "0.7"
+ddsfile = "0.5"
+winit = "0.30"
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level = 2
+
+[dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }
