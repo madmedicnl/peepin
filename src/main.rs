@@ -250,6 +250,7 @@ struct Peepin {
     settings: Option<Settings>,
 }
 
+
 impl Peepin {
     /// Print the palette and exit; used by `cargo run --example palette`.
     pub fn palette_for_debug() {
@@ -569,6 +570,11 @@ impl Peepin {
             .arg("--no-terminal")
             .arg("--loop-file=inf")
             .arg("--no-osc")
+            // Do not take the keyboard or the mouse: the window belongs to
+            // peepin, and peepin's own keys (next, quit, open) must keep working
+            // while the video plays.
+            .arg("--input-vo-keyboard=no")
+            .arg("--input-cursor=no")
             .arg("--no-input-default-bindings")
             .arg("--no-osd-bar");
         let embedded = match self.window_id {
@@ -1068,7 +1074,8 @@ impl eframe::App for Peepin {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
 
-        // The window is on screen now, so mpv can attach to it.
+        // The window is on screen now, so the child window can be made and mpv
+        // told where to draw.
         if self.pending_video.is_some() {
             self.start_pending_video();
         }
@@ -1200,16 +1207,13 @@ impl eframe::App for Peepin {
         }
 
         if self.embedded {
-            // mpv owns the window while a video plays; drawing here would erase it.
+            // mpv is drawing over the window; painting here would erase it.
             return;
         }
         self.draw_background(ui);
         self.draw_image(ui);
         self.status_bar(ui);
-
-        if !self.embedded {
-            ctx.request_repaint_after(std::time::Duration::from_millis(60));
-        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(60));
     }
 }
 
