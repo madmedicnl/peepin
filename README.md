@@ -257,6 +257,13 @@ mouse.left = prev
 mouse.right = next
 ```
 
+## Licence
+
+peepin is free software under the **GNU General Public License, version 3 or
+later** (GPL-3.0-or-later): you may use it, change it and pass it on under the
+same terms, and it comes with no warranty. The full text is in `LICENSE`. The
+icon in `assets/peep.png` belongs to the program.
+
 ## Notes
 
 - The window is transparent: the picture sits on whatever is behind it. Under a

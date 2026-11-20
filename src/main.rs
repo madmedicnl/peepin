@@ -7,6 +7,12 @@
 //! up/down zoom, Ctrl+O opens the picker and Ctrl+Q quits. Videos are handed to
 //! mpv, which draws inside this window; everything else goes through `image`,
 //! with `.dds` (Fallout's textures) through `image_dds`.
+//!
+//! peepin is free software: you can redistribute it and/or modify it under the
+//! terms of the GNU General Public License as published by the Free Software
+//! Foundation, either version 3 of the License, or (at your option) any later
+//! version. It comes without any warranty; see the LICENSE file, or
+//! <https://www.gnu.org/licenses/>.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

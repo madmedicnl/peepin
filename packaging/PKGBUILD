@@ -1,0 +1,49 @@
+# Maintainer: Roy Schuurmans <royschuurmans@gmail.com>
+pkgname=peepin-git
+pkgver=r12.2268f6c
+pkgrel=1
+pkgdesc='A tiny image and video viewer with a terminal feel'
+arch=('x86_64' 'aarch64')
+url='https://github.com/madmedicnl/peepin'
+license=('GPL-3.0-or-later')
+depends=('glibc' 'gcc-libs' 'libx11' 'libxkbcommon' 'libglvnd')
+makedepends=('cargo' 'git')
+optdepends=(
+  'mpv: video'
+  'imagemagick: heic, jxl, psd, svg and camera raw'
+  'graphicsmagick: the same formats, through gm'
+  'libheif: heic and heif, through heif-convert'
+  'libjxl: jpeg xl, through djxl'
+  'libvips: several formats, through vips'
+  'xorg-xwayland: video inside the window, with its bar'
+)
+provides=('peepin')
+conflicts=('peepin')
+source=("$pkgname::git+$url")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  cargo fetch --locked
+}
+
+build() {
+  cd "$pkgname"
+  # Keep the build directory out of the binary, or makepkg warns about a
+  # reference to $srcdir in /usr/bin/peepin.
+  RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$(pwd)=$pkgname" \
+    cargo build --release --locked --offline
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/peepin "$pkgdir/usr/bin/peepin"
+  install -Dm644 packaging/peepin.desktop "$pkgdir/usr/share/applications/peepin.desktop"
+  install -Dm644 assets/peep.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/peepin.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
