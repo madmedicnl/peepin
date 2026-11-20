@@ -130,8 +130,9 @@ name in the panel, in png, jpg (quality 92, alpha composited on white), webp
 Every image in the folder as a polaroid: a white card, the picture kept in its own
 proportions and centred, with the classic deeper bottom edge carrying the file
 name (soft-wrapped over two lines, with an ellipsis when it does not fit), laid
-out on a cream board (at most 96 images). Ctrl+S saves it; F3 or a new file closes
-it.
+out on a cream board (at most 96 images). Building it decodes every picture, so it
+runs on its own thread and the window says *building contact sheet…* while it
+works. Ctrl+S saves it; F3 or a new file closes it.
 
 ## Batch rename (F11)
 

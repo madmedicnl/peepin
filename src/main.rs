@@ -313,6 +313,8 @@ struct Peepin {
     overlay: Option<Overlay>,
     /// The contact sheet built by F3, until the next file is shown.
     sheet: Option<Sheet>,
+    /// A contact sheet being built in the background.
+    sheet_job: Option<std::sync::mpsc::Receiver<(egui::ColorImage, usize)>>,
 }
 
 
@@ -377,6 +379,7 @@ impl Peepin {
             source: None,
             overlay: None,
             sheet: None,
+            sheet_job: None,
         };
         app.read_config();
         app.load(&cc.egui_ctx);
@@ -435,11 +438,58 @@ impl Peepin {
             self.sheet = None;
             return;
         }
-        self.stop_video();
-        if let Some((image, count)) = build_sheet(&self.files) {
-            let texture = ctx.load_texture("sheet", image.clone(), egui::TextureOptions::LINEAR);
-            self.sheet = Some(Sheet { texture, image, count });
+        if self.sheet_job.is_some() {
+            return;
         }
+        self.stop_video();
+        let files = self.files.clone();
+        if files.is_empty() {
+            return;
+        }
+        // Decoding a folder of pictures takes a moment, so it happens on its own
+        // thread and the window says what it is doing.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Some((image, count)) = build_sheet(&files) {
+                let _ = tx.send((image, count));
+            }
+        });
+        self.sheet_job = Some(rx);
+        ctx.request_repaint();
+    }
+
+    /// Re-read the folder after its files were renamed, keeping the picture the
+    /// user was looking at when its new name is known.
+    fn reload_dir(&mut self, ctx: &egui::Context, preferred: Option<String>) {
+        let dir = self
+            .files
+            .get(self.index)
+            .and_then(|p| p.parent())
+            .or_else(|| self.files.first().and_then(|p| p.parent()))
+            .map(|p| p.to_path_buf());
+        let Some(dir) = dir else {
+            return;
+        };
+        let files = media_in(&dir);
+        if files.is_empty() {
+            self.files.clear();
+            self.index = 0;
+            self.texture = None;
+            self.source = None;
+            return;
+        }
+        let index = preferred
+            .and_then(|name| {
+                files.iter().position(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy() == name)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or_else(|| self.index.min(files.len() - 1));
+        self.files = files;
+        self.index = index;
+        self.load(ctx);
     }
 
     fn open_rename(&mut self) {
@@ -825,10 +875,31 @@ impl Peepin {
                 Some(Overlay::Rename(rename)) => {
                     let pattern = rename.pattern.clone();
                     let start: usize = rename.start.trim().parse().unwrap_or(1);
+                    // Where the picture on screen will end up, so it stays selected
+                    // after the folder is re-read.
+                    let image_index = self
+                        .files
+                        .iter()
+                        .take(self.index + 1)
+                        .filter(|p| is_image(p))
+                        .count()
+                        .saturating_sub(1);
+                    let width = self
+                        .files
+                        .iter()
+                        .filter(|p| is_image(p))
+                        .count()
+                        .max(1)
+                        .to_string()
+                        .len();
+                    let target = self.files.get(self.index).map(|path| {
+                        rename_name(&pattern, start + image_index, width, path)
+                    });
                     let result = rename_images(&self.files, &pattern, start);
                     if let Some(Overlay::Rename(rename)) = self.overlay.as_mut() {
                         rename.note = result;
                     }
+                    self.reload_dir(ui.ctx(), target);
                 }
                 _ => {}
             }
@@ -1330,6 +1401,35 @@ impl Peepin {
         }
     }
 
+    /// A line in the middle of the window saying what is happening.
+    fn busy(&self, ui: &mut egui::Ui, text: &str) {
+        let palette = self.palette;
+        let rect = ui.max_rect();
+        let centre = Pos2::new(rect.center().x, rect.center().y);
+        let painter = ui.painter();
+        let message = format!("{text}");
+
+        let galley = painter.layout_no_wrap(
+            message,
+            FontId::monospace(15.0),
+            palette.accent,
+        );
+        let box_rect = Rect::from_center_size(
+            centre,
+            galley.size() + Vec2::new(24.0, 14.0),
+        );
+        painter.rect_filled(box_rect, 2.0, palette.bg.gamma_multiply(0.85));
+        painter.rect_stroke(box_rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+        painter.galley(
+            Pos2::new(
+                box_rect.center().x - galley.size().x / 2.0,
+                box_rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            palette.fg,
+        );
+    }
+
     fn draw_sheet(&self, ui: &mut egui::Ui) {
         let Some(sheet) = &self.sheet else {
             return;
@@ -1778,6 +1878,22 @@ impl eframe::App for Peepin {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
 
+        // A contact sheet built in the background lands here when it is ready.
+        if let Some(rx) = self.sheet_job.as_ref() {
+            match rx.try_recv() {
+                Ok((image, count)) => {
+                    let texture =
+                        ctx.load_texture("sheet", image.clone(), egui::TextureOptions::LINEAR);
+                    self.sheet = Some(Sheet { texture, image, count });
+                    self.sheet_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.sheet_job = None;
+                }
+            }
+        }
+
         // The window is on screen now, so the child window can be made and mpv
         // told where to draw.
         if self.pending_video.is_some() {
@@ -1964,6 +2080,11 @@ impl eframe::App for Peepin {
             return;
         }
         self.draw_background(ui);
+        if self.sheet_job.is_some() {
+            self.busy(ui, "building contact sheet…");
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
         if self.sheet.is_some() {
             self.draw_sheet(ui);
             self.sheet_status(ui);
