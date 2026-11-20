@@ -643,6 +643,13 @@ struct Peepin {
     sub_cycle_at: Option<Instant>,
     /// `--sub-pick=N`: choose subtitle track N once, as the number keys do.
     sub_pick_at_start: Option<usize>,
+    /// `--sub-menu`: open the track list at start, the way a right click does.
+    sub_menu_at_start: bool,
+    /// The list of subtitle tracks, open above the bar: right-click on the chip.
+    sub_menu: bool,
+    /// A line shown instead of the file name for a moment, e.g. which track was
+    /// just picked.
+    video_note: Option<(String, Instant)>,
     /// A video waiting for the window to be mapped.
     pending_video: Option<PathBuf>,
     palette: Palette,
@@ -727,6 +734,9 @@ impl Peepin {
             sub_cycle_at_start: 0,
             sub_cycle_at: None,
             sub_pick_at_start: None,
+            sub_menu_at_start: false,
+            sub_menu: false,
+            video_note: None,
             pending_video: None,
             palette,
             background: Background::Transparent,
@@ -1397,18 +1407,25 @@ impl Peepin {
 
     /// Show track `id`, or none at all.
     fn select_sub(&mut self, id: Option<i64>) {
-        match id {
+        let note = match id {
             Some(id) => {
                 self.mpv_command(&["set_property", "sid", &id.to_string()]);
                 self.mpv_command(&["set_property", "sub-visibility", "yes"]);
                 self.mpv.sid = Some(id);
                 self.mpv.subs = true;
+                let place = self.mpv.tracks.iter().position(|t| t.id == id);
+                match place {
+                    Some(i) => format!("sub {}/{}: {}", i + 1, self.mpv.tracks.len(), track_name(&self.mpv.tracks[i])),
+                    None => "subtitle".to_string(),
+                }
             }
             None => {
                 self.mpv_command(&["set_property", "sid", "no"]);
                 self.mpv.sid = None;
+                "subtitles off".to_string()
             }
-        }
+        };
+        self.video_note = Some((note, Instant::now()));
     }
 
     /// The next subtitle track, and off after the last one. With no track in the
@@ -1498,7 +1515,7 @@ impl Peepin {
             }
         }
         // A panel or the picker wants the whole window for a moment.
-        let covered = self.overlay.is_some() || self.picker.is_some();
+        let covered = self.overlay.is_some() || self.picker.is_some() || self.sub_menu;
         if let Some(window) = self.video_window.as_mut() {
             window.show(!covered);
             if let Some(geometry) = video_geometry(ctx) {
@@ -1525,6 +1542,10 @@ impl Peepin {
         if self.sub_load_at_start && self.mpv.duration > 0.0 {
             self.sub_load_at_start = false;
             self.load_subtitle();
+        }
+        if self.sub_menu_at_start && !self.mpv.tracks.is_empty() && self.mpv.duration > 0.0 {
+            self.sub_menu_at_start = false;
+            self.sub_menu = true;
         }
         if let Some(number) = self.sub_pick_at_start {
             if !self.mpv.tracks.is_empty() && self.mpv.duration > 0.0 {
@@ -1605,6 +1626,83 @@ impl Peepin {
         }
     }
 
+    /// The list of subtitle tracks, above the chip. The video is out of the way
+    /// while it is open, since it would otherwise be drawn over it.
+    fn draw_sub_menu(&mut self, ui: &mut egui::Ui, bar: Rect) {
+        let palette = self.palette;
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.sub_menu = false;
+            return;
+        }
+
+        let rows = self.mpv.tracks.len() + 1;
+        let row_h = 22.0;
+        let width = 360.0_f32.min((bar.width() - 16.0).max(200.0));
+        let height = rows as f32 * row_h + 10.0;
+        let rect = Rect::from_min_size(
+            Pos2::new(bar.right() - 8.0 - width, bar.top() - height - 4.0),
+            Vec2::new(width, height),
+        );
+        ui.painter().rect_filled(rect, 2.0, palette.bg);
+        ui.painter()
+            .rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+
+        let hover = ctx.input(|i| i.pointer.hover_pos());
+        let mut pick: Option<usize> = None;
+        for i in 0..rows {
+            let row = Rect::from_min_size(
+                Pos2::new(rect.left() + 5.0, rect.top() + 5.0 + i as f32 * row_h),
+                Vec2::new(rect.width() - 10.0, row_h),
+            );
+            let (selected, label) = if i == 0 {
+                (self.mpv.sid.is_none(), "off".to_string())
+            } else {
+                let track = &self.mpv.tracks[i - 1];
+                (
+                    self.mpv.sid == Some(track.id),
+                    format!("{}  {}", i, track_name(track)),
+                )
+            };
+            if hover.map(|p| row.contains(p)).unwrap_or(false) {
+                ui.painter()
+                    .rect_filled(row, 1.0, palette.dim.gamma_multiply(0.35));
+            }
+            ui.painter().text(
+                Pos2::new(row.left() + 6.0, row.center().y),
+                Align2::LEFT_CENTER,
+                shorten(&format!("{} {label}", if selected { "●" } else { " " }), 46),
+                FontId::monospace(12.0),
+                if selected { palette.accent } else { palette.fg },
+            );
+            let hit = ui.interact(row, egui::Id::new(("sub-row", i)), egui::Sense::click());
+            if hit.clicked() {
+                pick = Some(i);
+            }
+        }
+
+        match pick {
+            Some(0) => {
+                self.select_sub(None);
+                self.sub_menu = false;
+            }
+            Some(i) => {
+                let id = self.mpv.tracks[i - 1].id;
+                self.select_sub(Some(id));
+                self.sub_menu = false;
+            }
+            None => {
+                // A left click anywhere else closes it.
+                let outside = ctx
+                    .input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
+                    && !hover.map(|p| rect.contains(p)).unwrap_or(false);
+                if outside {
+                    self.sub_menu = false;
+                }
+            }
+        }
+    }
+
     /// The bar under a video: name, seek, clock, pause, mute, volume, subtitles.
     fn video_bar(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette;
@@ -1660,12 +1758,21 @@ impl Peepin {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Just after a track was picked the bar says which one, in words.
+        let note = self
+            .video_note
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_millis(2500));
+        let (text, colour) = match note {
+            Some((note, _)) => (shorten(note, 34), palette.accent),
+            None => (shorten(&name, 30), palette.fg),
+        };
         ui.painter().text(
             name_rect.left_top(),
             Align2::LEFT_TOP,
-            shorten(&name, 30),
+            text,
             FontId::monospace(12.0),
-            palette.fg,
+            colour,
         );
         ui.painter().text(
             clock_rect.right_top(),
@@ -1714,6 +1821,9 @@ impl Peepin {
         if subs_hit.clicked() {
             self.cycle_subs();
         }
+        if subs_hit.secondary_clicked() {
+            self.sub_menu = !self.sub_menu;
+        }
         let load_hit = ui.interact(load, egui::Id::new("video-load"), egui::Sense::click());
         if load_hit.clicked() {
             self.load_subtitle();
@@ -1732,6 +1842,10 @@ impl Peepin {
                 let fraction = ((point.x - vol.left()) / vol.width()).clamp(0.0, 1.0);
                 self.set_volume(fraction as f64 * MAX_VOLUME);
             }
+        }
+
+        if self.sub_menu {
+            self.draw_sub_menu(ui, bar);
         }
 
         // The wheel over the bar is volume, the way a terminal player does it.
@@ -2472,6 +2586,24 @@ fn thumbnail(image: &egui::ColorImage, w: u32, h: u32) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw())
 }
 
+/// A track as a person reads it: its language and its title.
+fn track_name(track: &SubTrack) -> String {
+    let mut name = String::new();
+    if !track.lang.is_empty() {
+        name.push_str(&track.lang);
+    }
+    if !track.title.is_empty() {
+        if !name.is_empty() {
+            name.push_str(" — ");
+        }
+        name.push_str(&track.title);
+    }
+    if name.is_empty() {
+        name = format!("track {}", track.id);
+    }
+    name
+}
+
 /// What the subtitle chip would do, and which tracks there are.
 fn subtitle_hint(state: &VideoState) -> String {
     if state.tracks.is_empty() {
@@ -2479,23 +2611,10 @@ fn subtitle_hint(state: &VideoState) -> String {
     }
     let mut text = String::from("subtitle tracks:\n");
     for (i, track) in state.tracks.iter().enumerate() {
-        let mut name = String::new();
-        if !track.lang.is_empty() {
-            name.push_str(&track.lang);
-        }
-        if !track.title.is_empty() {
-            if !name.is_empty() {
-                name.push_str(" — ");
-            }
-            name.push_str(&track.title);
-        }
-        if name.is_empty() {
-            name = format!("track {}", track.id);
-        }
         let mark = if state.sid == Some(track.id) { "●" } else { "○" };
-        text.push_str(&format!("  {mark} {} {name}\n", i + 1));
+        text.push_str(&format!("  {mark} {} {}\n", i + 1, track_name(track)));
     }
-    text.push_str("1-9 pick one, 0 off, click: next one");
+    text.push_str("click: next one · right-click: this list · 0-9 pick one");
     text
 }
 
@@ -3432,6 +3551,9 @@ fn main() -> eframe::Result<()> {
                 .find_map(|a| a.strip_prefix("--sub-pick=").and_then(|v| v.parse::<usize>().ok()))
             {
                 app.sub_pick_at_start = Some(number);
+            }
+            if std::env::args().any(|a| a == "--sub-menu") {
+                app.sub_menu_at_start = true;
             }
             if save_at_start {
                 app.open_save();

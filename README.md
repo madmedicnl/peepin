@@ -60,7 +60,7 @@ edge, and the bar under it is peepin's to draw. That bar has, from the left:
 | the seek bar | drag or click to jump; the clock is on its right |
 | `\|\|` / `▶` | pause and play (`space`) |
 | `m` | mute, lit while muted |
-| `sub`, or `FRA` | the subtitle track. When one is showing, the label is its language; a click walks to the next track and off after the last, and hovering lists every track with its number |
+| `sub`, or `FRA` | the subtitle track. When one is showing, the label is its language. A click walks to the next track and off after the last; a **right click opens the list** — every track with its language and title, the one showing marked ●, and `off` at the top. Picking a track is followed by its name in the bar for a moment |
 | `srt` | load a subtitle file from this folder: the one named after the video if there is one, else the first `.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`, `.idx`, `.sup` |
 | the volume bar | drag or click; the wheel over the bar does it too, and `↑` `↓`; 100 is mpv's normal level, up to 130 |
 | a number | the volume in percent |
@@ -71,7 +71,11 @@ video), which is also why mpv keeps no keyboard and no mouse of its own.
 Subtitles come from the file itself when it has them — an MKV usually carries a
 few, and its first one is often already showing, because mpv picks one by its own
 language rules. The chip then reads that track's language (`FRA`, `NED`, `ENG`),
-and `0`–`9` choose a track outright while the numbers are in the hover text.
+`0`–`9` choose a track outright, and the right-click list names them all.
+
+While the list is open the video is out of the way, since it is a child window
+that would be drawn over the list; it comes back as soon as the list closes.
+
 `srt` is for a subtitle that is a separate file next to the video; mpv loads one
 with the video's exact name by itself, so `srt` is for the others.
 
