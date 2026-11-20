@@ -129,7 +129,9 @@ peepin --screenshot -d 3 out.png     # three seconds from now
 ```
 
 The path it wrote is printed, so `p=$(peepin --screenshot)` works in a script. A
-name that exists is not overwritten: `-2`, `-3` and on are added.
+name that exists is not overwritten: `-2`, `-3` and on are added. Without a FILE
+it goes to the folder set with F2 (`screenshot.dir`), or to the current
+directory, and the PNG is put on the clipboard like `p` does.
 
 Under Wayland the screen is taken with **grim** when it is installed, because a
 compositor's own picture is the only one that shows every window. Without it —
@@ -258,8 +260,13 @@ color.accent = #7fb3ad   # selection
 ## Settings (F2)
 
 The F2 panel edits the same file: background mode, which way each mouse button
-walks, and the four colours. `Ctrl+S` (or *save*) writes `peepin.conf` and applies
-it at once; `Esc` closes, `F2` toggles.
+walks, where screenshots go, and the four colours. `Ctrl+S` (or *save*) writes
+`peepin.conf` and applies it at once; `Esc` closes, `F2` toggles.
+
+```ini
+# where `p` and `peepin --screenshot` write; empty means beside the picture
+screenshot.dir = ~/Pictures/Screenshots
+```
 
 ## Saving (Ctrl+S)
 
@@ -269,11 +276,18 @@ name in the panel, in png, jpg (quality 92, alpha composited on white), webp
 
 ## Screenshot (p)
 
-`p` writes the window as it is on screen to `peepin-<date>-<time>.png` in the
-folder of the file you are looking at (`peepin-20261120-143512.png`), with a
-`-2`, `-3` when one already has that name. The picture, the background, the
-status bar — and a video, because the window is read from the X server with its
-children — are all in it, which makes it a good way to show what you see.
+`p` writes the window as it is on screen to `peepin-<date>-<time>.png`
+(`peepin-20261120-143512.png`), with a `-2`, `-3` when one already has that name.
+The folder is the one set in F2 (`screenshot.dir`); left empty, the picture goes
+beside the file you are looking at.
+
+It goes **on the clipboard** as well, so `Ctrl+V` in a chat or an editor pastes
+it straight away — `wl-copy` on Wayland, `xclip` on X11. The status bar says
+`shot → peepin-….png · clipboard` when both worked.
+
+The picture, the background, the status bar — and a video, because the window is
+read from the X server with its children — are all in it, which makes it a good
+way to show what you see.
 
 That last part is also why it needs the X11 window peepin already opens for mpv:
 under a compositor without XWayland there is nothing to read and the bar says so.

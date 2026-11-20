@@ -230,6 +230,8 @@ struct Settings {
     background: Background,
     left: Step,
     right: Step,
+    /// Where screenshots go; empty means "beside the picture on screen".
+    shot_dir: String,
     fg: String,
     bg: String,
     dim: String,
@@ -244,6 +246,7 @@ impl Settings {
             background: app.background,
             left: app.left_button,
             right: app.right_button,
+            shot_dir: app.shot_dir.clone(),
             fg: hex(app.palette.fg),
             bg: hex(app.palette.bg),
             dim: hex(app.palette.dim),
@@ -506,6 +509,74 @@ unsafe fn focused_top_level(
         }
         Some(window)
     }
+}
+
+/// `~/Pictures` and the like, as a path. Anything else is taken as it is.
+pub(crate) fn expand_home(path: &str) -> PathBuf {
+    let text = path.trim();
+    if let Some(rest) = text.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(text)
+}
+
+/// One value from `peepin.conf`, for the jobs the command line does alone.
+pub(crate) fn config_value(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() == key {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Put the PNG on the clipboard so it can be pasted straight away. Wayland's
+/// `wl-copy` goes on serving it after peepin has exited, which is what makes a
+/// one-shot `peepin --screenshot` useful; on X11 `xclip` does the same.
+pub(crate) fn copy_to_clipboard(png: &[u8]) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11: (&str, [&str; 5]) =
+        ("xclip", ["-selection", "clipboard", "-t", "image/png", "-i"]);
+    let wl: (&str, [&str; 3]) = ("wl-copy", ["-t", "image/png", ""]);
+    let attempts: Vec<(&str, Vec<&str>)> = if wayland {
+        vec![(wl.0, wl.1.iter().copied().filter(|a| !a.is_empty()).collect()), (x11.0, x11.1.to_vec())]
+    } else {
+        vec![(x11.0, x11.1.to_vec()), (wl.0, wl.1.iter().copied().filter(|a| !a.is_empty()).collect())]
+    };
+    for (program, args) in attempts {
+        let Ok(mut child) = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(png).is_err() {
+                let _ = child.wait();
+                continue;
+            }
+            drop(stdin);
+        }
+        if child.wait().map(|status| status.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `folder/name`, or `folder/stem-2.png` and on, so a second screenshot in the
@@ -819,6 +890,9 @@ struct Peepin {
     reverse: bool,
     /// Fit the picture to the window (the default) or show it at 100 %.
     fit: bool,
+    /// `screenshot.dir` from the config: where a screenshot is written. Empty
+    /// means beside the picture on screen.
+    shot_dir: String,
     left_button: Step,
     right_button: Step,
     drag: Option<(Pos2, Vec2)>,
@@ -951,6 +1025,7 @@ impl Peepin {
             status: String::new(),
             picker: None,
             previews: options.previews,
+            shot_dir: String::new(),
             sort: match options.sort {
                 cli::Sort::Name => SortKind::Name,
                 cli::Sort::Size => SortKind::Size,
@@ -1139,6 +1214,7 @@ impl Peepin {
              background = {}\n\
              mouse.left = {}\n\
              mouse.right = {}\n\
+             screenshot.dir = {}\n\
              color.fg = {}\n\
              color.bg = {}\n\
              color.dim = {}\n\
@@ -1156,6 +1232,7 @@ impl Peepin {
                 Step::Previous => "prev",
                 Step::Next => "next",
             },
+            settings.shot_dir,
             settings.fg,
             settings.bg,
             settings.dim,
@@ -1170,6 +1247,7 @@ impl Peepin {
                 self.background = settings.background;
                 self.left_button = settings.left;
                 self.right_button = settings.right;
+                self.shot_dir = settings.shot_dir.clone();
                 self.palette = Palette::load();
                 self.apply_palette(ctx);
                 "saved".to_string()
@@ -1331,6 +1409,16 @@ impl Peepin {
                         if button(ui, label, picked, palette) {
                             settings.background = mode;
                         }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("screenshot folder");
+                    let mut dir = settings.shot_dir.clone();
+                    let field = egui::TextEdit::singleline(&mut dir)
+                        .hint_text("beside the picture")
+                        .desired_width(260.0);
+                    if ui.add(field).changed() {
+                        settings.shot_dir = dir;
                     }
                 });
                 for (label, slot) in [("mouse left", 0), ("mouse right", 1)] {
@@ -1546,6 +1634,10 @@ impl Peepin {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
+            if key.trim() == "screenshot.dir" {
+                self.shot_dir = value.trim().to_string();
+                continue;
+            }
             if key.trim() == "background" {
                 self.background = match value.trim().to_ascii_lowercase().as_str() {
                     "blur" => Background::Blur,
@@ -1774,23 +1866,31 @@ impl Peepin {
         let path = match target {
             Some(path) => path,
             None => {
-                let folder = self
-                    .files
-                    .get(self.index)
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_path_buf())
-                    .or_else(|| std::env::current_dir().ok())
-                    .unwrap_or_else(|| PathBuf::from("."));
+                let folder = self.screenshot_folder();
+                let _ = std::fs::create_dir_all(&folder);
                 free_name(&folder, &format!("peepin-{}.png", stamp()))
             }
         };
-        match pixels.save(&path) {
+        let mut png: Vec<u8> = Vec::new();
+        if let Err(err) = image::DynamicImage::ImageRgba8(pixels).write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageFormat::Png,
+        ) {
+            self.say(format!("shot: {err}"));
+            return None;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match std::fs::write(&path, &png) {
             Ok(()) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.say(format!("shot → {name}"));
+                // On the clipboard as well, so it can be pasted at once.
+                let copied = copy_to_clipboard(&png);
+                self.say(format!(
+                    "shot → {name}{}",
+                    if copied { " · clipboard" } else { "" }
+                ));
                 Some(path)
             }
             Err(err) => {
@@ -1798,6 +1898,20 @@ impl Peepin {
                 None
             }
         }
+    }
+
+    /// Where a screenshot goes: the folder set in F2 (`screenshot.dir`), or the
+    /// folder of the picture on screen.
+    fn screenshot_folder(&self) -> PathBuf {
+        if !self.shot_dir.trim().is_empty() {
+            return expand_home(&self.shot_dir);
+        }
+        self.files
+            .get(self.index)
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// A line in the status bar, and in the video bar, for a few seconds.

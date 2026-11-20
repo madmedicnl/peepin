@@ -353,18 +353,30 @@ fn screenshot(file: Option<PathBuf>, window: bool, delay: f64) -> i32 {
     let path = match file {
         Some(path) => path,
         None => {
-            let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // The folder set in F2, else the one the shell is in.
+            let folder = crate::config_value("screenshot.dir")
+                .map(|value| crate::expand_home(&value))
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let _ = std::fs::create_dir_all(&folder);
             crate::free_name(&folder, &format!("peepin-{}.png", crate::stamp()))
         }
     };
-    match pixels.save(&path) {
-        Ok(()) => {
-            println!("{}", path.display());
-            0
-        }
-        Err(err) => {
-            eprintln!("peepin: {}: {err}", path.display());
-            1
-        }
+    let mut png: Vec<u8> = Vec::new();
+    if let Err(err) = image::DynamicImage::ImageRgba8(pixels).write_to(
+        &mut std::io::Cursor::new(&mut png),
+        image::ImageFormat::Png,
+    ) {
+        eprintln!("peepin: {err}");
+        return 1;
     }
+    if let Err(err) = std::fs::write(&path, &png) {
+        eprintln!("peepin: {}: {err}", path.display());
+        return 1;
+    }
+    if !crate::copy_to_clipboard(&png) {
+        eprintln!("peepin: the picture was written, but no clipboard tool took it");
+    }
+    println!("{}", path.display());
+    0
 }
