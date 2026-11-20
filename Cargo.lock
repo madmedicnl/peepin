@@ -2083,6 +2083,7 @@ dependencies = [
  "eframe",
  "image",
  "image_dds",
+ "libc",
  "raw-window-handle",
  "winit",
  "x11-dl",

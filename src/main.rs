@@ -423,6 +423,86 @@ fn video_geometry(ctx: &egui::Context) -> Option<(i32, i32, u32, u32)> {
     Some((0, 0, width, height))
 }
 
+/// `folder/name`, or `folder/stem-2.png` and on, so a second screenshot in the
+/// same second does not overwrite the first.
+fn free_name(folder: &Path, name: &str) -> PathBuf {
+    let path = folder.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let stem = Path::new(name).file_stem().map(|s| s.to_owned()).unwrap_or_default();
+    let extension = Path::new(name).extension().map(|e| e.to_owned());
+    for n in 2..1000 {
+        let candidate = match &extension {
+            Some(ext) => folder.join(format!("{}-{n}.{}", stem.to_string_lossy(), ext.to_string_lossy())),
+            None => folder.join(format!("{}-{n}", stem.to_string_lossy())),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
+/// `20261120-143512`, in local time: the name a screenshot gets.
+fn stamp() -> String {
+    // Local time, because that is what a person looks for in a folder listing.
+    let mut now: libc::time_t = 0;
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::time(&mut now);
+        libc::localtime_r(&now, &mut parts);
+    }
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        parts.tm_year + 1900,
+        parts.tm_mon + 1,
+        parts.tm_mday,
+        parts.tm_hour,
+        parts.tm_min,
+        parts.tm_sec
+    )
+}
+
+/// The window as it is on screen, as RGBA. `XGetImage` on our own window brings
+/// its children with it, so a video mpv draws inside is in the picture too.
+fn capture_window(window: u64) -> Option<image::RgbaImage> {
+    let xlib = x11_dl::xlib::Xlib::open().ok()?;
+    unsafe {
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let taken = (|| {
+            (xlib.XSync)(display, 0);
+            let mut attributes: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+            if (xlib.XGetWindowAttributes)(display, window, &mut attributes) == 0 {
+                return None;
+            }
+            let width = attributes.width.max(1) as u32;
+            let height = attributes.height.max(1) as u32;
+            let image = (xlib.XGetImage)(
+                display,
+                window,
+                0,
+                0,
+                width,
+                height,
+                !0,
+                x11_dl::xlib::ZPixmap,
+            );
+            if image.is_null() {
+                return None;
+            }
+            let pixels = image_pixels(&*image, attributes.depth, width, height);
+            (xlib.XDestroyImage)(image);
+            pixels
+        })();
+        (xlib.XCloseDisplay)(display);
+        taken
+    }
+}
+
 /// mpv's IPC socket for this run.
 fn mpv_socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
@@ -505,6 +585,39 @@ fn data_field(reply: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+/// The pixels of an `XImage` as RGBA. X hands 32-bit pixels as BGRX (or BGRA
+/// when the window has an alpha channel), four bytes each, with a stride that
+/// need not be the width.
+fn image_pixels(
+    photo: &x11_dl::xlib::XImage,
+    depth: i32,
+    width: u32,
+    height: u32,
+) -> Option<image::RgbaImage> {
+    let stride = photo.bytes_per_line as usize;
+        let len = stride.checked_mul(height as usize)?;
+        if photo.data.is_null() || len == 0 {
+            return None;
+        }
+        let data = unsafe { std::slice::from_raw_parts(photo.data as *const u8, len) };
+        let mut out = image::RgbaImage::new(width, height);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let at = y * stride + x * 4;
+                if at + 3 >= data.len() {
+                    continue;
+                }
+                let alpha = if depth > 24 { data[at + 3] } else { 255 };
+                out.put_pixel(
+                    x as u32,
+                    y as u32,
+                    image::Rgba([data[at + 2], data[at + 1], data[at], alpha]),
+                );
+            }
+        }
+    Some(out)
 }
 
 fn mpv_get(socket: &Path, property: &str) -> Option<String> {
@@ -656,6 +769,10 @@ struct Peepin {
     /// A line shown instead of the file name for a moment, e.g. which track was
     /// just picked.
     video_note: Option<(String, Instant)>,
+    /// A line shown in the status bar for a moment, e.g. where a screenshot went.
+    note: Option<(String, Instant)>,
+    /// `--screenshot=<file>`: take one once the first frame is on screen.
+    screenshot_at: Option<(Instant, PathBuf)>,
     /// A video waiting for the window to be mapped.
     pending_video: Option<PathBuf>,
     palette: Palette,
@@ -743,6 +860,8 @@ impl Peepin {
             sub_menu_at_start: false,
             sub_menu: false,
             video_note: None,
+            note: None,
+            screenshot_at: None,
             pending_video: None,
             palette,
             background: Background::Transparent,
@@ -1510,6 +1629,53 @@ impl Peepin {
         }
     }
 
+    /// Save the window as a PNG. `target` names the file; without one the name
+    /// is `peepin-<date>-<time>.png` in the folder of the file on screen.
+    fn screenshot(&mut self, target: Option<PathBuf>) -> Option<PathBuf> {
+        let Some(window) = self.window_id else {
+            self.say("screenshot: no X11 window to take it from");
+            return None;
+        };
+        let Some(pixels) = capture_window(window) else {
+            self.say("screenshot: the window could not be read");
+            return None;
+        };
+        let path = match target {
+            Some(path) => path,
+            None => {
+                let folder = self
+                    .files
+                    .get(self.index)
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                free_name(&folder, &format!("peepin-{}.png", stamp()))
+            }
+        };
+        match pixels.save(&path) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.say(format!("shot → {name}"));
+                Some(path)
+            }
+            Err(err) => {
+                self.say(format!("shot: {err}"));
+                None
+            }
+        }
+    }
+
+    /// A line in the status bar, and in the video bar, for a few seconds.
+    fn say(&mut self, note: impl Into<String>) {
+        let note = note.into();
+        self.video_note = Some((note.clone(), Instant::now()));
+        self.note = Some((note, Instant::now()));
+    }
+
     /// Keep the child window over the video area, follow a resize, and ask mpv
     /// where it is a few times a second.
     fn poll_video(&mut self, ctx: &egui::Context) {
@@ -1773,8 +1939,14 @@ impl Peepin {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_millis(2500));
         let (text, colour) = match note {
-            Some((note, _)) => (shorten(note, 34), palette.accent),
-            None => (shorten(&name, 30), palette.fg),
+            Some((note, _)) => (
+                fit_text(ui.painter(), note, name_rect.width(), FontId::monospace(12.0), palette.accent),
+                palette.accent,
+            ),
+            None => (
+                fit_text(ui.painter(), &name, name_rect.width(), FontId::monospace(12.0), palette.fg),
+                palette.fg,
+            ),
         };
         ui.painter().text(
             name_rect.left_top(),
@@ -2318,35 +2490,70 @@ impl Peepin {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         let palette = self.palette;
-        let text = format!(
-            "{}   {}   zoom {:.0}%   [←/→] next  [↑/↓ wheel] zoom  [b] {}  [ctrl+o] open  [ctrl+q] quit",
-            self.files
-                .get(self.index)
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
-                .unwrap_or_else(|| "peepin".to_string()),
-            if self.files.is_empty() {
-                String::new()
-            } else {
-                format!("{}/{}", self.index + 1, self.files.len())
-            },
-            self.zoom * 100.0,
-            match self.background {
-                Background::Transparent => "clear",
-                Background::Blur => "blur",
-                Background::Solid => "solid",
-            }
-        );
-        let painter = ui.painter();
         let rect = ui.max_rect();
         let bar = Rect::from_min_max(
             Pos2::new(rect.left() + 6.0, rect.bottom() - 20.0),
             Pos2::new(rect.right() - 6.0, rect.bottom() - 2.0),
         );
+        let font = FontId::monospace(12.0);
+        let painter = ui.painter();
+        let name = self
+            .files
+            .get(self.index)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "peepin".to_string());
+        let count = if self.files.is_empty() {
+            String::new()
+        } else {
+            format!("{}/{}", self.index + 1, self.files.len())
+        };
+        let zoom = format!("zoom {:.0}%", self.zoom * 100.0);
+        let background = match self.background {
+            Background::Transparent => "clear",
+            Background::Blur => "blur",
+            Background::Solid => "solid",
+        };
+        // From the full line down to the bare name: a long file name takes the
+        // room the hints would have had, and keeps its own tail in sight.
+        let tails = [
+            format!(
+                "   {count}   {zoom}   [←/→] next  [↑/↓ wheel] zoom  [b] {background}  [p] shot  [ctrl+o] open  [ctrl+q] quit"
+            ),
+            format!("   {count}   {zoom}   [b] {background}  [p] shot"),
+            format!("   {count}   {zoom}"),
+            format!("   {count}"),
+            String::new(),
+        ];
+        let room = bar.width() - 4.0;
+        let fresh = self
+            .note
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(4));
+        let tails = match fresh {
+            Some((note, _)) => vec![format!("   {count}   {note}")],
+            None => tails.to_vec(),
+        };
+        let mut text = String::new();
+        for tail in tails {
+            let used = painter
+                .layout_no_wrap(tail.clone(), font.clone(), palette.fg)
+                .size()
+                .x;
+            let for_name = room - used;
+            if for_name >= 40.0 || tail.is_empty() {
+                text = format!(
+                    "{}{tail}",
+                    fit_text(painter, &name, for_name.max(10.0), font.clone(), palette.fg)
+                );
+                break;
+            }
+        }
         painter.rect_filled(bar.expand2(Vec2::new(2.0, 1.0)), 2.0, palette.bg.gamma_multiply(0.7));
         painter.text(
             Pos2::new(bar.left(), bar.top()),
             Align2::LEFT_TOP,
-            text,
+            fit_text(painter, &text, room, font, palette.fg),
             FontId::monospace(12.0),
             palette.fg,
         );
@@ -2455,23 +2662,31 @@ impl Peepin {
         let Some(sheet) = &self.sheet else {
             return;
         };
-        let text = format!(
-            "contact sheet · {} image(s) · zoom {:.0}%   [←/→] next file  [↑/↓ wheel] zoom  [ctrl+s] save  [F3] close",
-            sheet.count,
-            self.zoom * 100.0
-        );
+        let font = FontId::monospace(12.0);
         let painter = ui.painter();
         let rect = ui.max_rect();
         let bar = Rect::from_min_max(
             Pos2::new(rect.left() + 6.0, rect.bottom() - 20.0),
             Pos2::new(rect.right() - 6.0, rect.bottom() - 2.0),
         );
+        let room = bar.width() - 4.0;
+        let text = fit_text(
+            painter,
+            &format!(
+                "contact sheet · {} image(s) · zoom {:.0}%   [←/→] next file  [↑/↓ wheel] zoom  [ctrl+s] save  [p] shot  [F3] close",
+                sheet.count,
+                self.zoom * 100.0
+            ),
+            room,
+            font.clone(),
+            palette.fg,
+        );
         painter.rect_filled(bar.expand2(Vec2::new(2.0, 1.0)), 2.0, palette.bg.gamma_multiply(0.7));
         painter.text(
             Pos2::new(bar.left(), bar.top()),
             Align2::LEFT_TOP,
             text,
-            FontId::monospace(12.0),
+            font,
             palette.fg,
         );
     }
@@ -2526,6 +2741,7 @@ const KEYS: &[(&str, &str)] = &[
     ("0", "fit to window again"),
     ("ctrl + ← → ↑ ↓", "resize the window"),
     ("b", "background: clear, blur, solid"),
+    ("p", "screenshot of the window"),
     ("space (video)", "pause"),
     ("↑ ↓ (video)", "volume"),
     ("m / s (video)", "mute / next subtitle track"),
@@ -2980,6 +3196,47 @@ fn build_sheet(files: &[PathBuf]) -> Option<(egui::ColorImage, usize)> {
     Some((color, count))
 }
 
+/// `text` cut to fit `max_width`, with an ellipsis where it was cut. The
+/// measurement is the painter's own, so a name and the rest of a status line
+/// together stay inside the window whatever the font or the scale.
+fn fit_text(
+    painter: &egui::Painter,
+    text: &str,
+    max_width: f32,
+    font: FontId,
+    colour: Color32,
+) -> String {
+    let width = |candidate: &str| {
+        painter
+            .layout_no_wrap(candidate.to_string(), font.clone(), colour)
+            .size()
+            .x
+    };
+    if width(text) <= max_width {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = 0;
+    let mut low = 0;
+    let mut high = chars.len();
+    while low <= high {
+        let mid = (low + high) / 2;
+        let mut candidate: String = chars[..mid].iter().collect();
+        candidate.push('…');
+        if width(&candidate) <= max_width {
+            keep = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let mut out: String = chars[..keep].iter().collect();
+    out.push('…');
+    out
+}
+
 fn shorten(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -3021,6 +3278,14 @@ impl eframe::App for Peepin {
 
         // The window is on screen now, so the child window can be made and mpv
         // told where to draw.
+        if let Some((at, path)) = self.screenshot_at.clone() {
+            if at.elapsed() > Duration::from_millis(1200) {
+                self.screenshot_at = None;
+                if let Some(written) = self.screenshot(Some(path)) {
+                    eprintln!("screenshot: {}", written.display());
+                }
+            }
+        }
         if self.pending_video.is_some() {
             self.start_pending_video(ctx);
         }
@@ -3202,6 +3467,12 @@ impl eframe::App for Peepin {
             }
         }
 
+        let plain_p = ctx.input(|i| {
+            !(i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::P)
+        });
+        if plain_p {
+            self.screenshot(None);
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::B)) {
             self.background = match self.background {
                 Background::Transparent => Background::Blur,
@@ -3612,6 +3883,11 @@ fn main() -> eframe::Result<()> {
                 .find_map(|a| a.strip_prefix("--seek=").and_then(|v| v.parse::<f64>().ok()))
             {
                 app.seek_at_start = Some(seconds);
+            }
+            if let Some(path) = std::env::args()
+                .find_map(|a| a.strip_prefix("--screenshot=").map(|p| p.to_string()))
+            {
+                app.screenshot_at = Some((Instant::now(), PathBuf::from(path)));
             }
             if std::env::args().any(|a| a == "--sub-load") {
                 app.sub_load_at_start = true;

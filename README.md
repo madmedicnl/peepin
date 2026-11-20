@@ -26,6 +26,8 @@ fitted into whatever space the window has.
 - **Contact sheet** `F3`: the whole folder as polaroids; `Ctrl+S` saves it.
 - **Batch rename** `F11`: `name-{n}`, with the first number typed in.
 - **Save as** `Ctrl+S`: png, jpg, webp, bmp or tiff.
+- **Screenshot** `p`: the window as it looks — picture, background, bars, video
+  included — written as a PNG beside the file.
 - **Your colours**: it reads kitty's config, and `F2` edits the rest.
 
 ## What it needs
@@ -106,6 +108,7 @@ peepin ~/Pictures            # the first picture in the folder
 | `F3` | contact sheet of the folder, as polaroids |
 | `F11` | batch rename the images in the folder |
 | `b` | background: clear → blur → solid |
+| `p` | screenshot of the window, saved beside the file |
 | `space` (video) | pause / play |
 | `↑` `↓` (video) | volume |
 | `m` (video) | mute |
@@ -216,6 +219,18 @@ it at once; `Esc` closes, `F2` toggles.
 Writes the picture at its own size — not as zoomed on screen — to the folder and
 name in the panel, in png, jpg (quality 92, alpha composited on white), webp
 (lossless), bmp or tiff. With a contact sheet open, Ctrl+S saves the sheet.
+
+## Screenshot (p)
+
+`p` writes the window as it is on screen to `peepin-<date>-<time>.png` in the
+folder of the file you are looking at (`peepin-20261120-143512.png`), with a
+`-2`, `-3` when one already has that name. The picture, the background, the
+status bar — and a video, because the window is read from the X server with its
+children — are all in it, which makes it a good way to show what you see.
+
+That last part is also why it needs the X11 window peepin already opens for mpv:
+under a compositor without XWayland there is nothing to read and the bar says so.
+The PNG keeps the window's transparency, so a "clear" background stays clear.
 
 ## Contact sheet (F3)
 
