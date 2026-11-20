@@ -105,13 +105,15 @@ name in the panel, in png, jpg (quality 92, alpha composited on white), webp
 ## Contact sheet (F3)
 
 Every image in the folder as a polaroid: a white card, the picture kept in its own
-proportions and centred, with the classic deeper bottom edge, laid out on a cream
-board (at most 96 images). Ctrl+S saves it; F3 or a new file closes it.
+proportions and centred, with the classic deeper bottom edge carrying the file
+name (soft-wrapped over two lines, with an ellipsis when it does not fit), laid
+out on a cream board (at most 96 images). Ctrl+S saves it; F3 or a new file closes
+it.
 
 ## Batch rename (F11)
 
 `{name}` is the old stem, `{n}` the number (zero-padded to the folder's count), and
-`start` is where numbering begins; the extension is kept. The panel previews the
+`start` is a field you type the first number into; the extension is kept. The panel previews the
 first twelve names, and *rename* renames the images in two passes, so a batch can
 never collide with itself.
 

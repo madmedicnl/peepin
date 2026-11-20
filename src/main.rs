@@ -261,7 +261,8 @@ struct Sheet {
 /// F11: batch rename of the images in the folder.
 struct RenameDialog {
     pattern: String,
-    start: usize,
+    /// Free text on purpose: it is typed in, and parsed when the rename runs.
+    start: String,
     note: String,
 }
 
@@ -286,6 +287,9 @@ struct Peepin {
     left_button: Step,
     right_button: Step,
     drag: Option<(Pos2, Vec2)>,
+    /// Left-button drag: start, pan when it began, and whether it moved far
+    /// enough to count as a pan rather than a click.
+    left_drag: Option<(Pos2, Vec2, bool)>,
     /// X11 window id, when the window could be created through XWayland. mpv
     /// draws its video into that window with `--wid`.
     window_id: Option<u64>,
@@ -358,6 +362,7 @@ impl Peepin {
             left_button: Step::Previous,
             right_button: Step::Next,
             drag: None,
+            left_drag: None,
             window_id: x11_window_id(cc),
             embedded: false,
             pending_video: None,
@@ -436,7 +441,7 @@ impl Peepin {
         let count = self.files.len();
         self.overlay = Some(Overlay::Rename(RenameDialog {
             pattern: "{name}-{n}".to_string(),
-            start: 1,
+            start: "1".to_string(),
             note: if count == 0 {
                 "no images or videos in this folder".to_string()
             } else {
@@ -531,7 +536,7 @@ impl Peepin {
                 Some(Overlay::Rename(_)) => None,
                 _ => Some(Overlay::Rename(RenameDialog {
                     pattern: "{name}-{n}".to_string(),
-                    start: 1,
+                    start: "1".to_string(),
                     note: String::new(),
                 })),
             };
@@ -764,9 +769,9 @@ impl Peepin {
                     );
                     ui.label("start");
                     ui.add(
-                        egui::TextEdit::singleline(&mut format!("{}", rename.start))
+                        egui::TextEdit::singleline(&mut rename.start)
                             .font(FontId::monospace(13.0))
-                            .desired_width(50.0),
+                            .desired_width(60.0),
                     );
                 });
                 ui.label(
@@ -783,7 +788,8 @@ impl Peepin {
                 let width = images.len().max(1).to_string().len();
                 for (i, path) in images.iter().take(12).enumerate() {
                     let old = path.file_name().unwrap_or_default().to_string_lossy();
-                    let new = rename_name(&rename.pattern, rename.start + i, width, path);
+                    let start: usize = rename.start.trim().parse().unwrap_or(1);
+                    let new = rename_name(&rename.pattern, start + i, width, path);
                     ui.label(
                         egui::RichText::new(format!("{old}  →  {new}")).color(palette.fg),
                     );
@@ -813,7 +819,7 @@ impl Peepin {
                 Some(Overlay::Save(_)) => self.save_picture(ui.ctx()),
                 Some(Overlay::Rename(rename)) => {
                     let pattern = rename.pattern.clone();
-                    let start = rename.start;
+                    let start: usize = rename.start.trim().parse().unwrap_or(1);
                     let result = rename_images(&self.files, &pattern, start);
                     if let Some(Overlay::Rename(rename)) = self.overlay.as_mut() {
                         rename.note = result;
@@ -1546,6 +1552,109 @@ fn rename_images(files: &[PathBuf], pattern: &str, start: usize) -> String {
     format!("{done} of {} renamed", staged.len())
 }
 
+/// The font used for the name under each polaroid: the first of these that is on
+/// disk and parses. Read once and kept.
+fn sheet_font() -> Option<&'static ab_glyph::FontVec> {
+    static FONT: std::sync::OnceLock<Option<ab_glyph::FontVec>> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        for path in [
+            "/usr/share/fonts/TTF/CascadiaCode.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/TTF/AdwaitaMono-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        ] {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(font) = ab_glyph::FontVec::try_from_vec(bytes) {
+                    return Some(font);
+                }
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+/// Break `text` into at most `max_lines` lines that fit `max_width`, adding an
+/// ellipsis when it does not all fit.
+fn wrap_text(
+    font: &ab_glyph::FontVec,
+    px: f32,
+    max_width: f32,
+    max_lines: usize,
+    text: &str,
+) -> Vec<String> {
+    use ab_glyph::{Font as _, ScaleFont as _};
+    let scaled = font.as_scaled(px);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut width = 0.0f32;
+    for ch in text.chars() {
+        let advance = scaled.h_advance(scaled.scaled_glyph(ch).id);
+        if width + advance > max_width && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            width = 0.0;
+            if lines.len() == max_lines {
+                let last = lines.last_mut().unwrap();
+                while !last.is_empty()
+                    && width + scaled.h_advance(scaled.scaled_glyph('…').id) > max_width
+                {
+                    last.pop();
+                }
+                last.push('…');
+                return lines;
+            }
+        }
+        current.push(ch);
+        width += advance;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Blend one line of text into the picture.
+fn draw_text(
+    image: &mut image::RgbaImage,
+    font: &ab_glyph::FontVec,
+    x: f32,
+    y: f32,
+    px: f32,
+    text: &str,
+    colour: [u8; 3],
+) {
+    use ab_glyph::{Font as _, ScaleFont as _};
+    let scaled = font.as_scaled(px);
+    let ascent = scaled.ascent();
+    let mut caret = x;
+    for ch in text.chars() {
+        let mut glyph = scaled.scaled_glyph(ch);
+        glyph.position = ab_glyph::point(caret, y + ascent);
+        caret += scaled.h_advance(glyph.id);
+        if let Some(outline) = scaled.outline_glyph(glyph) {
+            let bounds = outline.px_bounds();
+            outline.draw(|gx, gy, coverage| {
+                let px_x = bounds.min.x as i32 + gx as i32;
+                let px_y = bounds.min.y as i32 + gy as i32;
+                if px_x < 0 || px_y < 0 {
+                    return;
+                }
+                let (px_x, px_y) = (px_x as u32, px_y as u32);
+                if px_x >= image.width() || px_y >= image.height() {
+                    return;
+                }
+                let pixel = image.get_pixel_mut(px_x, px_y);
+                let alpha = coverage.clamp(0.0, 1.0);
+                for i in 0..3 {
+                    pixel.0[i] = (pixel.0[i] as f32 * (1.0 - alpha) + colour[i] as f32 * alpha) as u8;
+                }
+                pixel.0[3] = 255;
+            });
+        }
+    }
+}
+
 /// A contact sheet: every image in the folder as a polaroid, on a white board.
 fn build_sheet(files: &[PathBuf]) -> Option<(egui::ColorImage, usize)> {
     let images: Vec<&PathBuf> = files.iter().filter(|p| is_image(p)).collect();
@@ -1611,6 +1720,27 @@ fn build_sheet(files: &[PathBuf]) -> Option<(egui::ColorImage, usize)> {
             i64::from(x + MARGIN + (PICTURE_W - thumb_w) / 2),
             i64::from(y + MARGIN + (PICTURE_H - thumb_h) / 2),
         );
+
+        // The name, soft-wrapped into the polaroid's bottom band.
+        if let Some(font) = sheet_font() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let px = 13.0;
+            let lines = wrap_text(font, px, (PICTURE_W + 2 * MARGIN) as f32 - 8.0, 2, &name);
+            for (line_no, line) in lines.iter().enumerate() {
+                draw_text(
+                    &mut sheet,
+                    font,
+                    (x + MARGIN + 2) as f32,
+                    (y + MARGIN + PICTURE_H + 6) as f32 + line_no as f32 * (px + 2.0),
+                    px,
+                    line,
+                    [58, 55, 52],
+                );
+            }
+        }
     }
 
     let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -1733,8 +1863,37 @@ impl eframe::App for Peepin {
         if wheel.abs() > 0.5 {
             self.zoom_by(if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 });
         }
-        if clicked.0 {
-            self.step(ctx, self.left_button == Step::Next);
+        // The left button both steps and pans: a click (no movement) goes to the
+        // next file, a drag moves the zoomed picture.
+        let (primary_down, primary_released, pointer) = ctx.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.interact_pos(),
+            )
+        });
+        if primary_down {
+            match self.left_drag {
+                None => {
+                    self.left_drag = Some((pointer.unwrap_or_default(), self.pan, false));
+                }
+                Some((start, from, moved)) => {
+                    if let Some(now) = pointer {
+                        let delta = now - start;
+                        let moved = moved || delta.length() > 4.0;
+                        if moved {
+                            self.pan = from + delta;
+                        }
+                        self.left_drag = Some((start, from, moved));
+                    }
+                }
+            }
+        } else if primary_released {
+            if let Some((_, _, moved)) = self.left_drag.take() {
+                if !moved {
+                    self.step(ctx, self.left_button == Step::Next);
+                }
+            }
         }
         if clicked.1 {
             self.step(ctx, self.right_button == Step::Next);
