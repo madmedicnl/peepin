@@ -71,8 +71,10 @@ distribution's cargo is usually older than edition 2024 needs:
 sudo apt install mpv imagemagick
 ```
 
-For pacman there is a `PKGBUILD` in `packaging/` (`peepin-git`) which can build
-and install the package locally; `packaging/README.md` says how:
+A built `peepin-git` package is attached to the
+[latest release](https://github.com/madmedicnl/peepin/releases) — download it and
+`sudo pacman -U peepin-git-*.pkg.tar.zst`. Or build it yourself from the
+`PKGBUILD` in `packaging/`; `packaging/README.md` says how:
 
 ```sh
 mkdir -p ~/aur/peepin-git && cp packaging/PKGBUILD packaging/.SRCINFO ~/aur/peepin-git/
