@@ -8,7 +8,12 @@ fn main() {
     let file = std::fs::File::open(&path).expect("open");
     let mut reader = std::io::BufReader::new(file);
     let dds = ddsfile::Dds::read(&mut reader).expect("read header");
-    println!("header: {}x{}, mips {}", dds.get_width(), dds.get_height(), dds.get_num_mipmap_levels());
+    println!(
+        "header: {}x{}, mips {}",
+        dds.get_width(),
+        dds.get_height(),
+        dds.get_num_mipmap_levels()
+    );
     match image_dds::image_from_dds(&dds, 0) {
         Ok(image) => println!("rgba8: {}x{}", image.width(), image.height()),
         Err(err) => println!("decode failed: {err:?}"),

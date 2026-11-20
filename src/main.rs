@@ -30,12 +30,11 @@ use egui::{
 /// Everything `image` can open out of the box.
 const IMAGE_EXTS: &[&str] = &[
     // what `image` reads itself
-    "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr", "exr",
-    "dds", "ico", "pnm", "ff", "farbfeld", "avif",
+    "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr", "exr", "dds",
+    "ico", "pnm", "ff", "farbfeld", "avif",
     // and what the fallback decoders (below) cover
-    "heic", "heif", "jxl", "jp2", "j2k", "psd", "pcx", "xcf", "wmf", "emf", "svg",
-    "cr2", "cr3", "nef", "arw", "dng", "orf", "raf", "rw2", "pef", "srw", "3fr", "mrw",
-    "jxr", "wdp", "hdp",
+    "heic", "heif", "jxl", "jp2", "j2k", "psd", "pcx", "xcf", "wmf", "emf", "svg", "cr2", "cr3",
+    "nef", "arw", "dng", "orf", "raf", "rw2", "pef", "srw", "3fr", "mrw", "jxr", "wdp", "hdp",
 ];
 
 /// Handed to mpv.
@@ -377,7 +376,13 @@ impl VideoWindow {
             (xlib.XMapWindow)(display, window);
             (xlib.XFlush)(display);
         }
-        Some(Self { xlib, display, window, geometry, mapped: true })
+        Some(Self {
+            xlib,
+            display,
+            window,
+            geometry,
+            mapped: true,
+        })
     }
 
     /// Hide the video while a panel or the picker wants the window.
@@ -432,10 +437,8 @@ fn video_geometry(ctx: &egui::Context) -> Option<(i32, i32, u32, u32)> {
 /// when there is a Wayland session, because XWayland's root window cannot see
 /// windows that are not its own; the X11 read is the fallback.
 pub fn grab_screen(focused: bool) -> Option<image::RgbaImage> {
-    if !focused {
-        if let Some(pixels) = grim_screen() {
-            return Some(pixels);
-        }
+    if !focused && let Some(pixels) = grim_screen() {
+        return Some(pixels);
     }
     let window = screen_window(focused)?;
     capture_window(window)
@@ -443,9 +446,7 @@ pub fn grab_screen(focused: bool) -> Option<image::RgbaImage> {
 
 /// `grim -` gives the compositor's own picture of the output.
 fn grim_screen() -> Option<image::RgbaImage> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return None;
-    }
+    std::env::var_os("WAYLAND_DISPLAY")?;
     let output = std::process::Command::new("grim")
         .arg("-")
         .stderr(std::process::Stdio::null())
@@ -454,7 +455,9 @@ fn grim_screen() -> Option<image::RgbaImage> {
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
-    image::load_from_memory(&output.stdout).ok().map(|image| image.to_rgba8())
+    image::load_from_memory(&output.stdout)
+        .ok()
+        .map(|image| image.to_rgba8())
 }
 
 /// The X11 window a screenshot reads: the root, or the top-level window that has
@@ -467,7 +470,11 @@ fn screen_window(focused: bool) -> Option<u64> {
             return None;
         }
         let root = (xlib.XDefaultRootWindow)(display);
-        let window = if focused { focused_top_level(&xlib, display, root) } else { Some(root) };
+        let window = if focused {
+            focused_top_level(&xlib, display, root)
+        } else {
+            Some(root)
+        };
         (xlib.XCloseDisplay)(display);
         window
     }
@@ -514,10 +521,10 @@ unsafe fn focused_top_level(
 /// `~/Pictures` and the like, as a path. Anything else is taken as it is.
 pub(crate) fn expand_home(path: &str) -> PathBuf {
     let text = path.trim();
-    if let Some(rest) = text.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     PathBuf::from(text)
 }
@@ -547,13 +554,27 @@ pub(crate) fn copy_to_clipboard(png: &[u8]) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let x11: (&str, [&str; 5]) =
-        ("xclip", ["-selection", "clipboard", "-t", "image/png", "-i"]);
+    let x11: (&str, [&str; 5]) = (
+        "xclip",
+        ["-selection", "clipboard", "-t", "image/png", "-i"],
+    );
     let wl: (&str, [&str; 3]) = ("wl-copy", ["-t", "image/png", ""]);
     let attempts: Vec<(&str, Vec<&str>)> = if wayland {
-        vec![(wl.0, wl.1.iter().copied().filter(|a| !a.is_empty()).collect()), (x11.0, x11.1.to_vec())]
+        vec![
+            (
+                wl.0,
+                wl.1.iter().copied().filter(|a| !a.is_empty()).collect(),
+            ),
+            (x11.0, x11.1.to_vec()),
+        ]
     } else {
-        vec![(x11.0, x11.1.to_vec()), (wl.0, wl.1.iter().copied().filter(|a| !a.is_empty()).collect())]
+        vec![
+            (x11.0, x11.1.to_vec()),
+            (
+                wl.0,
+                wl.1.iter().copied().filter(|a| !a.is_empty()).collect(),
+            ),
+        ]
     };
     for (program, args) in attempts {
         let Ok(mut child) = Command::new(program)
@@ -586,11 +607,18 @@ pub(crate) fn free_name(folder: &Path, name: &str) -> PathBuf {
     if !path.exists() {
         return path;
     }
-    let stem = Path::new(name).file_stem().map(|s| s.to_owned()).unwrap_or_default();
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
     let extension = Path::new(name).extension().map(|e| e.to_owned());
     for n in 2..1000 {
         let candidate = match &extension {
-            Some(ext) => folder.join(format!("{}-{n}.{}", stem.to_string_lossy(), ext.to_string_lossy())),
+            Some(ext) => folder.join(format!(
+                "{}-{n}.{}",
+                stem.to_string_lossy(),
+                ext.to_string_lossy()
+            )),
             None => folder.join(format!("{}-{n}", stem.to_string_lossy())),
         };
         if !candidate.exists() {
@@ -753,26 +781,26 @@ fn image_pixels(
     height: u32,
 ) -> Option<image::RgbaImage> {
     let stride = photo.bytes_per_line as usize;
-        let len = stride.checked_mul(height as usize)?;
-        if photo.data.is_null() || len == 0 {
-            return None;
-        }
-        let data = unsafe { std::slice::from_raw_parts(photo.data as *const u8, len) };
-        let mut out = image::RgbaImage::new(width, height);
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let at = y * stride + x * 4;
-                if at + 3 >= data.len() {
-                    continue;
-                }
-                let alpha = if depth > 24 { data[at + 3] } else { 255 };
-                out.put_pixel(
-                    x as u32,
-                    y as u32,
-                    image::Rgba([data[at + 2], data[at + 1], data[at], alpha]),
-                );
+    let len = stride.checked_mul(height as usize)?;
+    if photo.data.is_null() || len == 0 {
+        return None;
+    }
+    let data = unsafe { std::slice::from_raw_parts(photo.data as *const u8, len) };
+    let mut out = image::RgbaImage::new(width, height);
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let at = y * stride + x * 4;
+            if at + 3 >= data.len() {
+                continue;
             }
+            let alpha = if depth > 24 { data[at + 3] } else { 255 };
+            out.put_pixel(
+                x as u32,
+                y as u32,
+                image::Rgba([data[at + 2], data[at + 1], data[at], alpha]),
+            );
         }
+    }
     Some(out)
 }
 
@@ -950,17 +978,24 @@ struct Peepin {
     sheet_job: Option<std::sync::mpsc::Receiver<(egui::ColorImage, usize)>>,
 }
 
-
 impl Peepin {
     /// Print the palette and exit; used by `cargo run --example palette`.
     pub fn palette_for_debug() {
         let p = Palette::load();
         println!(
             "fg={:02x}{:02x}{:02x} bg={:02x}{:02x}{:02x} dim={:02x}{:02x}{:02x} accent={:02x}{:02x}{:02x}",
-            p.fg.r(), p.fg.g(), p.fg.b(),
-            p.bg.r(), p.bg.g(), p.bg.b(),
-            p.dim.r(), p.dim.g(), p.dim.b(),
-            p.accent.r(), p.accent.g(), p.accent.b()
+            p.fg.r(),
+            p.fg.g(),
+            p.fg.b(),
+            p.bg.r(),
+            p.bg.g(),
+            p.bg.b(),
+            p.dim.r(),
+            p.dim.g(),
+            p.dim.b(),
+            p.accent.r(),
+            p.accent.g(),
+            p.accent.b()
         );
     }
 
@@ -968,7 +1003,7 @@ impl Peepin {
         let palette = Palette::load();
 
         cc.egui_ctx.all_styles_mut(|style| {
-            for (_, font) in style.text_styles.iter_mut() {
+            for font in style.text_styles.values_mut() {
                 font.family = FontFamily::Monospace;
             }
             style.spacing.item_spacing = Vec2::new(4.0, 1.0);
@@ -1112,7 +1147,12 @@ impl Peepin {
             .get(self.index)
             .and_then(|p| p.parent())
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned());
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
         let stem = if self.sheet.is_some() {
             "contactsheet".to_string()
         } else {
@@ -1354,10 +1394,7 @@ impl Peepin {
     fn draw_overlay(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette;
         let screen = ui.max_rect();
-        let size = Vec2::new(
-            screen.width().min(680.0),
-            screen.height().min(520.0),
-        );
+        let size = Vec2::new(screen.width().min(680.0), screen.height().min(520.0));
         let rect = Rect::from_min_size(Pos2::new(screen.left() + 12.0, screen.top() + 12.0), size);
         let mut panel = ui.new_child(
             egui::UiBuilder::new()
@@ -1374,209 +1411,221 @@ impl Peepin {
         let mut close = false;
         let mut save_now = false;
 
-        egui::Frame::new().inner_margin(8.0).show(&mut panel, |ui| match self.overlay.as_mut() {
-            Some(Overlay::Help) => {
-                ui.label(egui::RichText::new("keys").color(palette.accent));
-                ui.separator();
-                for (key, what) in KEYS {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [190.0, 16.0],
-                            egui::Label::new(
-                                egui::RichText::new(*key).color(palette.accent).monospace(),
-                            ),
-                        );
-                        ui.label(*what);
-                    });
+        egui::Frame::new()
+            .inner_margin(8.0)
+            .show(&mut panel, |ui| match self.overlay.as_mut() {
+                Some(Overlay::Help) => {
+                    ui.label(egui::RichText::new("keys").color(palette.accent));
+                    ui.separator();
+                    for (key, what) in KEYS {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [190.0, 16.0],
+                                egui::Label::new(
+                                    egui::RichText::new(*key).color(palette.accent).monospace(),
+                                ),
+                            );
+                            ui.label(*what);
+                        });
+                    }
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("F1 closes this  ·  F2 settings").color(palette.dim),
+                    );
                 }
-                ui.separator();
-                ui.label(egui::RichText::new("F1 closes this  ·  F2 settings").color(palette.dim));
-            }
-            Some(Overlay::Settings(settings)) => {
-                ui.label(egui::RichText::new("settings").color(palette.accent));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("background");
-                    for (label, mode) in [
-                        ("clear", Background::Transparent),
-                        ("blur", Background::Blur),
-                        ("solid", Background::Solid),
-                    ] {
-                        let picked = settings.background == mode;
-                        if button(ui, label, picked, palette) {
-                            settings.background = mode;
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("screenshot folder");
-                    let mut dir = settings.shot_dir.clone();
-                    let field = egui::TextEdit::singleline(&mut dir)
-                        .hint_text("beside the picture")
-                        .desired_width(260.0);
-                    if ui.add(field).changed() {
-                        settings.shot_dir = dir;
-                    }
-                });
-                for (label, slot) in [("mouse left", 0), ("mouse right", 1)] {
+                Some(Overlay::Settings(settings)) => {
+                    ui.label(egui::RichText::new("settings").color(palette.accent));
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(label);
-                        for (text, step) in [("prev", Step::Previous), ("next", Step::Next)] {
-                            let current = if slot == 0 { settings.left } else { settings.right };
-                            if button(ui, text, current == step, palette) {
-                                if slot == 0 {
-                                    settings.left = step;
-                                } else {
-                                    settings.right = step;
-                                }
+                        ui.label("background");
+                        for (label, mode) in [
+                            ("clear", Background::Transparent),
+                            ("blur", Background::Blur),
+                            ("solid", Background::Solid),
+                        ] {
+                            let picked = settings.background == mode;
+                            if button(ui, label, picked, palette) {
+                                settings.background = mode;
                             }
                         }
                     });
-                }
-                ui.separator();
-                for (label, value) in [
-                    ("text", &mut settings.fg),
-                    ("panel", &mut settings.bg),
-                    ("dim", &mut settings.dim),
-                    ("accent", &mut settings.accent),
-                ] {
                     ui.horizontal(|ui| {
-                        ui.label(label);
+                        ui.label("screenshot folder");
+                        let mut dir = settings.shot_dir.clone();
+                        let field = egui::TextEdit::singleline(&mut dir)
+                            .hint_text("beside the picture")
+                            .desired_width(260.0);
+                        if ui.add(field).changed() {
+                            settings.shot_dir = dir;
+                        }
+                    });
+                    for (label, slot) in [("mouse left", 0), ("mouse right", 1)] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            for (text, step) in [("prev", Step::Previous), ("next", Step::Next)] {
+                                let current = if slot == 0 {
+                                    settings.left
+                                } else {
+                                    settings.right
+                                };
+                                if button(ui, text, current == step, palette) {
+                                    if slot == 0 {
+                                        settings.left = step;
+                                    } else {
+                                        settings.right = step;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    ui.separator();
+                    for (label, value) in [
+                        ("text", &mut settings.fg),
+                        ("panel", &mut settings.bg),
+                        ("dim", &mut settings.dim),
+                        ("accent", &mut settings.accent),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.add(
+                                egui::TextEdit::singleline(value)
+                                    .font(FontId::monospace(13.0))
+                                    .desired_width(120.0),
+                            );
+                        });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("save  (ctrl+s)").clicked() {
+                            save_now = true;
+                        }
+                        if ui.button("close  (esc)").clicked() {
+                            close = true;
+                        }
+                        if !settings.note.is_empty() {
+                            ui.label(egui::RichText::new(&settings.note).color(palette.dim));
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "colours as #rrggbb; the terminal's own are read at start",
+                        )
+                        .color(palette.dim),
+                    );
+                }
+                Some(Overlay::Save(dialog)) => {
+                    ui.label(egui::RichText::new("save as").color(palette.accent));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("folder");
                         ui.add(
-                            egui::TextEdit::singleline(value)
+                            egui::TextEdit::singleline(&mut dialog.dir)
                                 .font(FontId::monospace(13.0))
-                                .desired_width(120.0),
+                                .desired_width(f32::INFINITY),
                         );
                     });
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("save  (ctrl+s)").clicked() {
-                        save_now = true;
-                    }
-                    if ui.button("close  (esc)").clicked() {
-                        close = true;
-                    }
-                    if !settings.note.is_empty() {
-                        ui.label(egui::RichText::new(&settings.note).color(palette.dim));
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("colours as #rrggbb; the terminal's own are read at start")
-                        .color(palette.dim),
-                );
-            }
-            Some(Overlay::Save(dialog)) => {
-                ui.label(egui::RichText::new("save as").color(palette.accent));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("folder");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut dialog.dir)
-                            .font(FontId::monospace(13.0))
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("name  ");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut dialog.name)
-                            .font(FontId::monospace(13.0))
-                            .desired_width(220.0),
-                    );
-                    ui.label(egui::RichText::new(format!(".{}", dialog.format.ext())).color(palette.dim));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("format");
-                    for (label, format) in [
-                        ("png", Format::Png),
-                        ("jpg", Format::Jpeg),
-                        ("webp", Format::Webp),
-                        ("bmp", Format::Bmp),
-                        ("tiff", Format::Tiff),
-                    ] {
-                        if button(ui, label, dialog.format == format, palette) {
-                            dialog.format = format;
+                    ui.horizontal(|ui| {
+                        ui.label("name  ");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.name)
+                                .font(FontId::monospace(13.0))
+                                .desired_width(220.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(".{}", dialog.format.ext()))
+                                .color(palette.dim),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("format");
+                        for (label, format) in [
+                            ("png", Format::Png),
+                            ("jpg", Format::Jpeg),
+                            ("webp", Format::Webp),
+                            ("bmp", Format::Bmp),
+                            ("tiff", Format::Tiff),
+                        ] {
+                            if button(ui, label, dialog.format == format, palette) {
+                                dialog.format = format;
+                            }
+                            ui.add_space(2.0);
                         }
-                        ui.add_space(2.0);
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("save  (ctrl+s)").clicked() {
+                            save_now = true;
+                        }
+                        if ui.button("close  (esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                    if !dialog.note.is_empty() {
+                        ui.label(egui::RichText::new(&dialog.note).color(palette.dim));
                     }
-                });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("save  (ctrl+s)").clicked() {
-                        save_now = true;
-                    }
-                    if ui.button("close  (esc)").clicked() {
-                        close = true;
-                    }
-                });
-                if !dialog.note.is_empty() {
-                    ui.label(egui::RichText::new(&dialog.note).color(palette.dim));
-                }
-                ui.label(
-                    egui::RichText::new(if self.sheet.is_some() {
-                        "the contact sheet is what gets saved"
-                    } else {
-                        "the picture is saved at its own size, not as zoomed on screen"
-                    })
-                    .color(palette.dim),
-                );
-            }
-            Some(Overlay::Rename(rename)) => {
-                ui.label(egui::RichText::new("batch rename").color(palette.accent));
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("pattern");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut rename.pattern)
-                            .font(FontId::monospace(13.0))
-                            .desired_width(240.0),
-                    );
-                    ui.label("start");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut rename.start)
-                            .font(FontId::monospace(13.0))
-                            .desired_width(60.0),
-                    );
-                });
-                ui.label(
-                    egui::RichText::new("{name} = the old name, {n} = the number; only images are renamed")
-                        .color(palette.dim),
-                );
-                ui.separator();
-                let images: Vec<PathBuf> = self
-                    .files
-                    .iter()
-                    .filter(|p| is_image(p))
-                    .cloned()
-                    .collect();
-                let width = images.len().max(1).to_string().len();
-                for (i, path) in images.iter().take(12).enumerate() {
-                    let old = path.file_name().unwrap_or_default().to_string_lossy();
-                    let start: usize = rename.start.trim().parse().unwrap_or(1);
-                    let new = rename_name(&rename.pattern, start + i, width, path);
                     ui.label(
-                        egui::RichText::new(format!("{old}  →  {new}")).color(palette.fg),
+                        egui::RichText::new(if self.sheet.is_some() {
+                            "the contact sheet is what gets saved"
+                        } else {
+                            "the picture is saved at its own size, not as zoomed on screen"
+                        })
+                        .color(palette.dim),
                     );
                 }
-                if images.len() > 12 {
-                    ui.label(egui::RichText::new(format!("… {} more", images.len() - 12)).color(palette.dim));
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("rename").clicked() {
-                        save_now = true;
+                Some(Overlay::Rename(rename)) => {
+                    ui.label(egui::RichText::new("batch rename").color(palette.accent));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("pattern");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut rename.pattern)
+                                .font(FontId::monospace(13.0))
+                                .desired_width(240.0),
+                        );
+                        ui.label("start");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut rename.start)
+                                .font(FontId::monospace(13.0))
+                                .desired_width(60.0),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "{name} = the old name, {n} = the number; only images are renamed",
+                        )
+                        .color(palette.dim),
+                    );
+                    ui.separator();
+                    let images: Vec<PathBuf> =
+                        self.files.iter().filter(|p| is_image(p)).cloned().collect();
+                    let width = images.len().max(1).to_string().len();
+                    for (i, path) in images.iter().take(12).enumerate() {
+                        let old = path.file_name().unwrap_or_default().to_string_lossy();
+                        let start: usize = rename.start.trim().parse().unwrap_or(1);
+                        let new = rename_name(&rename.pattern, start + i, width, path);
+                        ui.label(egui::RichText::new(format!("{old}  →  {new}")).color(palette.fg));
                     }
-                    if ui.button("close  (esc)").clicked() {
-                        close = true;
+                    if images.len() > 12 {
+                        ui.label(
+                            egui::RichText::new(format!("… {} more", images.len() - 12))
+                                .color(palette.dim),
+                        );
                     }
-                });
-                if !rename.note.is_empty() {
-                    ui.label(egui::RichText::new(&rename.note).color(palette.dim));
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("rename").clicked() {
+                            save_now = true;
+                        }
+                        if ui.button("close  (esc)").clicked() {
+                            close = true;
+                        }
+                    });
+                    if !rename.note.is_empty() {
+                        ui.label(egui::RichText::new(&rename.note).color(palette.dim));
+                    }
                 }
-            }
-            None => {}
-        });
+                None => {}
+            });
 
         if save_now {
             match self.overlay.as_ref() {
@@ -1602,9 +1651,10 @@ impl Peepin {
                         .max(1)
                         .to_string()
                         .len();
-                    let target = self.files.get(self.index).map(|path| {
-                        rename_name(&pattern, start + image_index, width, path)
-                    });
+                    let target = self
+                        .files
+                        .get(self.index)
+                        .map(|path| rename_name(&pattern, start + image_index, width, path));
                     let result = rename_images(&self.files, &pattern, start);
                     if let Some(Overlay::Rename(rename)) = self.overlay.as_mut() {
                         rename.note = result;
@@ -1707,7 +1757,10 @@ impl Peepin {
                 self.video = Some(child);
                 self.embedded = embedded;
                 self.mpv_socket = Some(socket);
-                self.mpv = VideoState { volume: 100.0, ..VideoState::default() };
+                self.mpv = VideoState {
+                    volume: 100.0,
+                    ..VideoState::default()
+                };
                 self.mpv_polled = None;
                 self.status = if embedded {
                     format!("▶ {name}  (mpv, embedded)")
@@ -1763,7 +1816,12 @@ impl Peepin {
                 self.mpv.subs = true;
                 let place = self.mpv.tracks.iter().position(|t| t.id == id);
                 match place {
-                    Some(i) => format!("sub {}/{}: {}", i + 1, self.mpv.tracks.len(), track_name(&self.mpv.tracks[i])),
+                    Some(i) => format!(
+                        "sub {}/{}: {}",
+                        i + 1,
+                        self.mpv.tracks.len(),
+                        track_name(&self.mpv.tracks[i])
+                    ),
                     None => "subtitle".to_string(),
                 }
             }
@@ -1807,7 +1865,11 @@ impl Peepin {
     fn toggle_subs(&mut self) {
         let on = !self.mpv.subs;
         self.mpv.subs = on;
-        self.mpv_command(&["set_property", "sub-visibility", if on { "yes" } else { "no" }]);
+        self.mpv_command(&[
+            "set_property",
+            "sub-visibility",
+            if on { "yes" } else { "no" },
+        ]);
     }
 
     /// Load a subtitle file: the one named after the video if there is one, else
@@ -1855,12 +1917,12 @@ impl Peepin {
         if self.video.is_none() {
             return;
         }
-        if let Some(child) = self.video.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
-                self.stop_video();
-                self.status = "video stopped".to_string();
-                return;
-            }
+        if let Some(child) = self.video.as_mut()
+            && let Ok(Some(_)) = child.try_wait()
+        {
+            self.stop_video();
+            self.status = "video stopped".to_string();
+            return;
         }
         // A panel or the picker wants the whole window for a moment.
         let covered = self.overlay.is_some() || self.picker.is_some() || self.sub_menu;
@@ -1881,11 +1943,11 @@ impl Peepin {
             self.mpv_polled = Some(Instant::now());
         }
         // Test hooks: a start-up seek and a subtitle load, once mpv is running.
-        if let Some(seconds) = self.seek_at_start {
-            if self.mpv.duration > 0.0 {
-                self.seek_at_start = None;
-                self.seek_to(seconds);
-            }
+        if let Some(seconds) = self.seek_at_start
+            && self.mpv.duration > 0.0
+        {
+            self.seek_at_start = None;
+            self.seek_to(seconds);
         }
         if self.sub_load_at_start && self.mpv.duration > 0.0 {
             self.sub_load_at_start = false;
@@ -1895,11 +1957,12 @@ impl Peepin {
             self.sub_menu_at_start = false;
             self.sub_menu = true;
         }
-        if let Some(number) = self.sub_pick_at_start {
-            if !self.mpv.tracks.is_empty() && self.mpv.duration > 0.0 {
-                self.sub_pick_at_start = None;
-                self.pick_sub(number);
-            }
+        if let Some(number) = self.sub_pick_at_start
+            && !self.mpv.tracks.is_empty()
+            && self.mpv.duration > 0.0
+        {
+            self.sub_pick_at_start = None;
+            self.pick_sub(number);
         }
         if self.sub_cycle_at_start > 0 && !self.mpv.tracks.is_empty() && self.mpv.duration > 0.0 {
             let due = self
@@ -1967,10 +2030,10 @@ impl Peepin {
             .iter()
             .position(|key| i.key_pressed(*key))
         });
-        if let Some(number) = digit {
-            if !self.mpv.tracks.is_empty() {
-                self.pick_sub(number);
-            }
+        if let Some(number) = digit
+            && !self.mpv.tracks.is_empty()
+        {
+            self.pick_sub(number);
         }
     }
 
@@ -2041,8 +2104,7 @@ impl Peepin {
             }
             None => {
                 // A left click anywhere else closes it.
-                let outside = ctx
-                    .input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
+                let outside = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary))
                     && !hover.map(|p| rect.contains(p)).unwrap_or(false);
                 if outside {
                     self.sub_menu = false;
@@ -2055,13 +2117,13 @@ impl Peepin {
     fn video_bar(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette;
         let area = ui.max_rect();
-        let bar = Rect::from_min_max(
-            Pos2::new(area.left(), area.bottom() - VIDEO_BAR),
-            area.max,
-        );
+        let bar = Rect::from_min_max(Pos2::new(area.left(), area.bottom() - VIDEO_BAR), area.max);
         ui.painter().rect_filled(bar, 0.0, palette.bg);
         ui.painter().line_segment(
-            [Pos2::new(bar.left(), bar.top()), Pos2::new(bar.right(), bar.top())],
+            [
+                Pos2::new(bar.left(), bar.top()),
+                Pos2::new(bar.right(), bar.top()),
+            ],
             Stroke::new(1.0, palette.dim),
         );
 
@@ -2113,11 +2175,23 @@ impl Peepin {
             .filter(|(_, at)| at.elapsed() < Duration::from_millis(2500));
         let (text, colour) = match note {
             Some((note, _)) => (
-                fit_text(ui.painter(), note, name_rect.width(), FontId::monospace(12.0), palette.accent),
+                fit_text(
+                    ui.painter(),
+                    note,
+                    name_rect.width(),
+                    FontId::monospace(12.0),
+                    palette.accent,
+                ),
                 palette.accent,
             ),
             None => (
-                fit_text(ui.painter(), &name, name_rect.width(), FontId::monospace(12.0), palette.fg),
+                fit_text(
+                    ui.painter(),
+                    &name,
+                    name_rect.width(),
+                    FontId::monospace(12.0),
+                    palette.fg,
+                ),
                 palette.fg,
             ),
         };
@@ -2153,10 +2227,22 @@ impl Peepin {
         );
 
         // Chips: pause, mute, subtitles, load subtitles.
-        paint_chip(ui, pause, if self.mpv.paused { "▶" } else { "||" }, false, palette);
+        paint_chip(
+            ui,
+            pause,
+            if self.mpv.paused { "▶" } else { "||" },
+            false,
+            palette,
+        );
         paint_chip(ui, mute, "m", self.mpv.muted, palette);
         let subs_label = self.mpv.label();
-        paint_chip(ui, subs, &subs_label, self.mpv.subs && self.mpv.sid.is_some(), palette);
+        paint_chip(
+            ui,
+            subs,
+            &subs_label,
+            self.mpv.subs && self.mpv.sid.is_some(),
+            palette,
+        );
         paint_chip(ui, load, "srt", false, palette);
 
         let pause_hit = ui.interact(pause, egui::Id::new("video-pause"), egui::Sense::click());
@@ -2183,19 +2269,27 @@ impl Peepin {
             self.load_subtitle();
         }
 
-        let seek_hit = ui.interact(seek, egui::Id::new("video-seek"), egui::Sense::click_and_drag());
-        if seek_hit.dragged() || seek_hit.clicked() {
-            if let Some(point) = seek_hit.interact_pointer_pos() {
-                let fraction = ((point.x - seek.left()) / seek.width()).clamp(0.0, 1.0);
-                self.seek_to(fraction as f64 * self.mpv.duration);
-            }
+        let seek_hit = ui.interact(
+            seek,
+            egui::Id::new("video-seek"),
+            egui::Sense::click_and_drag(),
+        );
+        if (seek_hit.dragged() || seek_hit.clicked())
+            && let Some(point) = seek_hit.interact_pointer_pos()
+        {
+            let fraction = ((point.x - seek.left()) / seek.width()).clamp(0.0, 1.0);
+            self.seek_to(fraction as f64 * self.mpv.duration);
         }
-        let vol_hit = ui.interact(vol, egui::Id::new("video-volume"), egui::Sense::click_and_drag());
-        if vol_hit.dragged() || vol_hit.clicked() {
-            if let Some(point) = vol_hit.interact_pointer_pos() {
-                let fraction = ((point.x - vol.left()) / vol.width()).clamp(0.0, 1.0);
-                self.set_volume(fraction as f64 * MAX_VOLUME);
-            }
+        let vol_hit = ui.interact(
+            vol,
+            egui::Id::new("video-volume"),
+            egui::Sense::click_and_drag(),
+        );
+        if (vol_hit.dragged() || vol_hit.clicked())
+            && let Some(point) = vol_hit.interact_pointer_pos()
+        {
+            let fraction = ((point.x - vol.left()) / vol.width()).clamp(0.0, 1.0);
+            self.set_volume(fraction as f64 * MAX_VOLUME);
         }
 
         if self.sub_menu {
@@ -2203,12 +2297,16 @@ impl Peepin {
         }
 
         // The wheel over the bar is volume, the way a terminal player does it.
-        let (hover, wheel) = ui.ctx().input(|i| (i.pointer.hover_pos(), i.smooth_scroll_delta.y));
-        if let Some(point) = hover {
-            if bar.contains(point) && wheel.abs() > 0.5 && !vol_hit.dragged() {
-                let step = if wheel > 0.0 { 3.0 } else { -3.0 };
-                self.set_volume(self.mpv.volume + step);
-            }
+        let (hover, wheel) = ui
+            .ctx()
+            .input(|i| (i.pointer.hover_pos(), i.smooth_scroll_delta.y));
+        if let Some(point) = hover
+            && bar.contains(point)
+            && wheel.abs() > 0.5
+            && !vol_hit.dragged()
+        {
+            let step = if wheel > 0.0 { 3.0 } else { -3.0 };
+            self.set_volume(self.mpv.volume + step);
         }
     }
 
@@ -2232,7 +2330,10 @@ impl Peepin {
     }
 
     fn order(&self) -> Order {
-        Order { kind: self.sort, reverse: self.reverse }
+        Order {
+            kind: self.sort,
+            reverse: self.reverse,
+        }
     }
 
     fn step(&mut self, ctx: &egui::Context, forward: bool) {
@@ -2301,8 +2402,14 @@ impl Peepin {
             .unwrap_or_else(|| PathBuf::from("/"));
         self.picker = Some(Pick {
             path: start,
-            folders: Pane { entries: Vec::new(), selected: 0 },
-            files: Pane { entries: Vec::new(), selected: 0 },
+            folders: Pane {
+                entries: Vec::new(),
+                selected: 0,
+            },
+            files: Pane {
+                entries: Vec::new(),
+                selected: 0,
+            },
             on_folders: true,
             error: String::new(),
             preview: self.previews,
@@ -2343,8 +2450,8 @@ impl Peepin {
                         files.push((name, path));
                     }
                 }
-                dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-                files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+                dirs.sort_by_key(|a| a.0.to_lowercase());
+                files.sort_by_key(|a| a.0.to_lowercase());
                 pick.folders.entries.extend(dirs);
                 pick.files.entries.extend(files);
             }
@@ -2420,7 +2527,11 @@ impl Peepin {
         }
         if up || down {
             pick.scroll = true;
-            let pane = if pick.on_folders { &mut pick.folders } else { &mut pick.files };
+            let pane = if pick.on_folders {
+                &mut pick.folders
+            } else {
+                &mut pick.files
+            };
             if !pane.entries.is_empty() {
                 pane.selected = if up {
                     (pane.selected + pane.entries.len() - 1) % pane.entries.len()
@@ -2467,70 +2578,68 @@ impl Peepin {
         // under eframe's ui-based app entry point.
         let screen = ui.max_rect();
         let size = Vec2::new(screen.width().min(760.0), screen.height().min(460.0));
-        let rect = Rect::from_min_size(
-            Pos2::new(screen.left() + 12.0, screen.top() + 12.0),
-            size,
-        );
+        let rect = Rect::from_min_size(Pos2::new(screen.left() + 12.0, screen.top() + 12.0), size);
         let mut panel = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        panel.painter().rect_filled(rect, 2.0, palette.bg.gamma_multiply(0.94));
-        panel.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+        panel
+            .painter()
+            .rect_filled(rect, 2.0, palette.bg.gamma_multiply(0.94));
+        panel
+            .painter()
+            .rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
 
-        egui::Frame::new()
-            .inner_margin(6.0)
-            .show(&mut panel, |ui| {
-                let height = (ui.available_height() - 22.0).max(80.0);
-                ui.horizontal_top(|ui| {
-                    let column = ui.available_width() * 0.4;
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(column, height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.label(egui::RichText::new("folders").color(palette.dim));
-                            egui::ScrollArea::vertical()
-                                .id_salt("folders")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for (i, (name, path)) in pick.folders.entries.iter().enumerate() {
-                                        let picked = pick.on_folders && i == pick.folders.selected;
-                                        if pane_row(ui, name, picked, palette) {
-                                            folder_click = Some(path.clone());
-                                        }
+        egui::Frame::new().inner_margin(6.0).show(&mut panel, |ui| {
+            let height = (ui.available_height() - 22.0).max(80.0);
+            ui.horizontal_top(|ui| {
+                let column = ui.available_width() * 0.4;
+                ui.allocate_ui_with_layout(
+                    Vec2::new(column, height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.label(egui::RichText::new("folders").color(palette.dim));
+                        egui::ScrollArea::vertical()
+                            .id_salt("folders")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (i, (name, path)) in pick.folders.entries.iter().enumerate() {
+                                    let picked = pick.on_folders && i == pick.folders.selected;
+                                    if pane_row(ui, name, picked, palette) {
+                                        folder_click = Some(path.clone());
                                     }
-                                });
-                        },
-                    );
-                    ui.separator();
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(ui.available_width(), height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            let header = if pick.preview {
-                                "files   (v: names only)"
-                            } else {
-                                "files   (v: previews)"
-                            };
-                            ui.label(egui::RichText::new(header).color(palette.dim));
-                            let files = pick.files.entries.clone();
-                            if pick.preview {
-                                // One row is a thumbnail and its name; only the rows
-                                // on screen are decoded, so a big folder stays quick.
-                                let row = 76.0;
-                                let mut budget = 2;
-                                egui::ScrollArea::vertical()
-                                    .id_salt("files-preview")
-                                    .auto_shrink([false, false])
-                                    .show_rows(ui, row, files.len(), |ui, range| {
-                                        for i in range {
-                                            let (name, path) = files[i].clone();
-                                            let picked =
-                                                !pick.on_folders && i == pick.files.selected;
-                                            let mut hit = false;
-                                            let row_rect = ui
-                                                .horizontal(|ui| {
+                                }
+                            });
+                    },
+                );
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), height),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        let header = if pick.preview {
+                            "files   (v: names only)"
+                        } else {
+                            "files   (v: previews)"
+                        };
+                        ui.label(egui::RichText::new(header).color(palette.dim));
+                        let files = pick.files.entries.clone();
+                        if pick.preview {
+                            // One row is a thumbnail and its name; only the rows
+                            // on screen are decoded, so a big folder stays quick.
+                            let row = 76.0;
+                            let mut budget = 2;
+                            egui::ScrollArea::vertical()
+                                .id_salt("files-preview")
+                                .auto_shrink([false, false])
+                                .show_rows(ui, row, files.len(), |ui, range| {
+                                    for i in range {
+                                        let (name, path) = files[i].clone();
+                                        let picked = !pick.on_folders && i == pick.files.selected;
+                                        let mut hit = false;
+                                        let row_rect = ui
+                                            .horizontal(|ui| {
                                                 let mut later = false;
                                                 let thumb = thumb_for(
                                                     ui.ctx(),
@@ -2568,7 +2677,11 @@ impl Peepin {
                                                         ui.painter().text(
                                                             rect.center(),
                                                             Align2::CENTER_CENTER,
-                                                            if is_video(&path) { "▶" } else { "?" },
+                                                            if is_video(&path) {
+                                                                "▶"
+                                                            } else {
+                                                                "?"
+                                                            },
                                                             FontId::monospace(14.0),
                                                             palette.dim,
                                                         );
@@ -2579,78 +2692,75 @@ impl Peepin {
                                                     hit = true;
                                                 }
                                             })
-                                                .response
-                                                .rect;
-                                            if picked && pick.scroll {
-                                                ui.scroll_to_rect(
-                                                    row_rect,
-                                                    Some(egui::Align::Center),
-                                                );
-                                                pick.scroll = false;
-                                            }
-                                            if hit {
-                                                file_click = Some(path);
-                                            }
+                                            .response
+                                            .rect;
+                                        if picked && pick.scroll {
+                                            ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                                            pick.scroll = false;
                                         }
-                                    });
-                                if files.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new("no images or videos here")
-                                            .color(palette.dim),
-                                    );
-                                }
-                            } else {
-                                egui::ScrollArea::vertical()
-                                    .id_salt("files")
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        for (i, (name, path)) in files.iter().enumerate() {
-                                            let picked = !pick.on_folders && i == pick.files.selected;
-                                            if picked && pick.scroll {
-                                                ui.scroll_to_rect(
-                                                    Rect::from_min_size(
-                                                        ui.cursor().min,
-                                                        Vec2::new(ui.available_width(), 18.0),
-                                                    ),
-                                                    Some(egui::Align::Center),
-                                                );
-                                                pick.scroll = false;
-                                            }
-                                            if pane_row(ui, name, picked, palette) {
-                                                file_click = Some(path.clone());
-                                            }
+                                        if hit {
+                                            file_click = Some(path);
                                         }
-                                        if files.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new("no images or videos here")
-                                                    .color(palette.dim),
-                                            );
-                                        }
-                                    });
+                                    }
+                                });
+                            if files.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("no images or videos here")
+                                        .color(palette.dim),
+                                );
                             }
-                        },
-                    );
-                });
-                pick.scroll = false;
-
-                if !pick.error.is_empty() {
-                    ui.label(egui::RichText::new(&pick.error).color(Color32::LIGHT_RED));
-                }
-                // The path, inverse video along the bottom, like a TUI status line.
-                let text = pick.path.to_string_lossy().into_owned();
-                let bar = Rect::from_min_size(
-                    Pos2::new(ui.min_rect().left(), ui.max_rect().bottom() - 18.0),
-                    Vec2::new(ui.max_rect().width(), 18.0),
-                );
-                ui.painter().rect_filled(bar, 0.0, palette.dim);
-                ui.painter().text(
-                    Pos2::new(bar.left() + 4.0, bar.top() + 1.0),
-                    Align2::LEFT_TOP,
-                    shorten(&text, 110),
-                    FontId::monospace(12.0),
-                    palette.bg,
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .id_salt("files")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for (i, (name, path)) in files.iter().enumerate() {
+                                        let picked = !pick.on_folders && i == pick.files.selected;
+                                        if picked && pick.scroll {
+                                            ui.scroll_to_rect(
+                                                Rect::from_min_size(
+                                                    ui.cursor().min,
+                                                    Vec2::new(ui.available_width(), 18.0),
+                                                ),
+                                                Some(egui::Align::Center),
+                                            );
+                                            pick.scroll = false;
+                                        }
+                                        if pane_row(ui, name, picked, palette) {
+                                            file_click = Some(path.clone());
+                                        }
+                                    }
+                                    if files.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("no images or videos here")
+                                                .color(palette.dim),
+                                        );
+                                    }
+                                });
+                        }
+                    },
                 );
             });
+            pick.scroll = false;
+
+            if !pick.error.is_empty() {
+                ui.label(egui::RichText::new(&pick.error).color(Color32::LIGHT_RED));
+            }
+            // The path, inverse video along the bottom, like a TUI status line.
+            let text = pick.path.to_string_lossy().into_owned();
+            let bar = Rect::from_min_size(
+                Pos2::new(ui.min_rect().left(), ui.max_rect().bottom() - 18.0),
+                Vec2::new(ui.max_rect().width(), 18.0),
+            );
+            ui.painter().rect_filled(bar, 0.0, palette.dim);
+            ui.painter().text(
+                Pos2::new(bar.left() + 4.0, bar.top() + 1.0),
+                Align2::LEFT_TOP,
+                shorten(&text, 110),
+                FontId::monospace(12.0),
+                palette.bg,
+            );
+        });
 
         if let Some(path) = folder_click {
             if let Some(pick) = self.picker.as_mut() {
@@ -2718,7 +2828,11 @@ impl Peepin {
                 break;
             }
         }
-        painter.rect_filled(bar.expand2(Vec2::new(2.0, 1.0)), 2.0, palette.bg.gamma_multiply(0.7));
+        painter.rect_filled(
+            bar.expand2(Vec2::new(2.0, 1.0)),
+            2.0,
+            palette.bg.gamma_multiply(0.7),
+        );
         painter.text(
             Pos2::new(bar.left(), bar.top()),
             Align2::LEFT_TOP,
@@ -2781,19 +2895,17 @@ impl Peepin {
         let rect = ui.max_rect();
         let centre = Pos2::new(rect.center().x, rect.center().y);
         let painter = ui.painter();
-        let message = format!("{text}");
+        let message = text.to_string();
 
-        let galley = painter.layout_no_wrap(
-            message,
-            FontId::monospace(15.0),
-            palette.accent,
-        );
-        let box_rect = Rect::from_center_size(
-            centre,
-            galley.size() + Vec2::new(24.0, 14.0),
-        );
+        let galley = painter.layout_no_wrap(message, FontId::monospace(15.0), palette.accent);
+        let box_rect = Rect::from_center_size(centre, galley.size() + Vec2::new(24.0, 14.0));
         painter.rect_filled(box_rect, 2.0, palette.bg.gamma_multiply(0.85));
-        painter.rect_stroke(box_rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+        painter.rect_stroke(
+            box_rect,
+            2.0,
+            Stroke::new(1.0, palette.dim),
+            StrokeKind::Inside,
+        );
         painter.galley(
             Pos2::new(
                 box_rect.center().x - galley.size().x / 2.0,
@@ -2813,9 +2925,7 @@ impl Peepin {
         let area = ui.max_rect();
         let area = Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 22.0));
         let size = Vec2::new(sheet.image.width() as f32, sheet.image.height() as f32);
-        let fit = (area.width() / size.x)
-            .min(area.height() / size.y)
-            .min(1.0);
+        let fit = (area.width() / size.x).min(area.height() / size.y).min(1.0);
         let rect = Rect::from_center_size(area.center() + self.pan, size * fit * self.zoom);
         painter.image(
             sheet.texture.id(),
@@ -2850,7 +2960,11 @@ impl Peepin {
             font.clone(),
             palette.fg,
         );
-        painter.rect_filled(bar.expand2(Vec2::new(2.0, 1.0)), 2.0, palette.bg.gamma_multiply(0.7));
+        painter.rect_filled(
+            bar.expand2(Vec2::new(2.0, 1.0)),
+            2.0,
+            palette.bg.gamma_multiply(0.7),
+        );
         painter.text(
             Pos2::new(bar.left(), bar.top()),
             Align2::LEFT_TOP,
@@ -2898,9 +3012,13 @@ fn pane_row(ui: &mut egui::Ui, name: &str, selected: bool, palette: Palette) -> 
         (palette.fg, Color32::TRANSPARENT)
     };
     ui.add(
-        egui::Button::new(egui::RichText::new(name).color(colour).font(FontId::monospace(13.0)))
-            .fill(background)
-            .frame(selected),
+        egui::Button::new(
+            egui::RichText::new(name)
+                .color(colour)
+                .font(FontId::monospace(13.0)),
+        )
+        .fill(background)
+        .frame(selected),
     )
     .clicked()
 }
@@ -2979,8 +3097,7 @@ fn thumbnail(image: &egui::ColorImage, w: u32, h: u32) -> egui::ColorImage {
     let sw = ((src.width() as f32 * scale).ceil() as u32).max(w);
     let sh = ((src.height() as f32 * scale).ceil() as u32).max(h);
     let scaled = image::imageops::resize(&src, sw, sh, image::imageops::FilterType::Triangle);
-    let cropped =
-        image::imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
+    let cropped = image::imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw())
 }
 
@@ -3009,7 +3126,11 @@ fn subtitle_hint(state: &VideoState) -> String {
     }
     let mut text = String::from("subtitle tracks:\n");
     for (i, track) in state.tracks.iter().enumerate() {
-        let mark = if state.sid == Some(track.id) { "●" } else { "○" };
+        let mark = if state.sid == Some(track.id) {
+            "●"
+        } else {
+            "○"
+        };
         text.push_str(&format!("  {mark} {} {}\n", i + 1, track_name(track)));
     }
     text.push_str("click: next one · right-click: this list · 0-9 pick one");
@@ -3020,7 +3141,8 @@ fn subtitle_hint(state: &VideoState) -> String {
 fn paint_bar(ui: &egui::Ui, rect: Rect, fraction: f32, palette: Palette) {
     let fraction = fraction.clamp(0.0, 1.0);
     let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
-    ui.painter().rect_filled(track, 1.0, palette.dim.gamma_multiply(0.45));
+    ui.painter()
+        .rect_filled(track, 1.0, palette.dim.gamma_multiply(0.45));
     let filled = Rect::from_min_max(
         track.min,
         Pos2::new(track.left() + track.width() * fraction, track.bottom()),
@@ -3041,7 +3163,8 @@ fn paint_chip(ui: &egui::Ui, rect: Rect, text: &str, active: bool, palette: Pale
         (palette.bg, palette.fg)
     };
     ui.painter().rect_filled(rect, 2.0, fill);
-    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+    ui.painter()
+        .rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -3059,7 +3182,11 @@ fn button(ui: &mut egui::Ui, label: &str, picked: bool, palette: Palette) -> boo
                 .color(if picked { palette.bg } else { palette.fg })
                 .monospace(),
         )
-        .fill(if picked { palette.accent } else { Color32::TRANSPARENT })
+        .fill(if picked {
+            palette.accent
+        } else {
+            Color32::TRANSPARENT
+        })
         .frame(picked),
     )
     .clicked()
@@ -3070,14 +3197,24 @@ fn button(ui: &mut egui::Ui, label: &str, picked: bool, palette: Palette) -> boo
 fn write_image(image: &egui::ColorImage, path: &Path, format: Format) -> Result<(), String> {
     let width = image.width() as u32;
     let height = image.height() as u32;
-    let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b(), p.a()]).collect();
+    let rgba: Vec<u8> = image
+        .pixels
+        .iter()
+        .flat_map(|p| [p.r(), p.g(), p.b(), p.a()])
+        .collect();
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut out = std::io::BufWriter::new(file);
     match format {
         Format::Png => {
             let encoder = image::codecs::png::PngEncoder::new(&mut out);
-            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|e| e.to_string())
+            image::ImageEncoder::write_image(
+                encoder,
+                &rgba,
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| e.to_string())
         }
         Format::Jpeg => {
             let mut rgb = Vec::with_capacity((width * height * 3) as usize);
@@ -3093,18 +3230,36 @@ fn write_image(image: &egui::ColorImage, path: &Path, format: Format) -> Result<
         }
         Format::Webp => {
             let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
-            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|e| e.to_string())
+            image::ImageEncoder::write_image(
+                encoder,
+                &rgba,
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| e.to_string())
         }
         Format::Bmp => {
             let encoder = image::codecs::bmp::BmpEncoder::new(&mut out);
-            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|e| e.to_string())
+            image::ImageEncoder::write_image(
+                encoder,
+                &rgba,
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| e.to_string())
         }
         Format::Tiff => {
             let encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
-            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|e| e.to_string())
+            image::ImageEncoder::write_image(
+                encoder,
+                &rgba,
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| e.to_string())
         }
     }
 }
@@ -3121,9 +3276,7 @@ fn rename_name(pattern: &str, number: usize, width: usize, path: &Path) -> Strin
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_default();
     let number = format!("{number:0width$}");
-    let base = pattern
-        .replace("{name}", &stem)
-        .replace("{n}", &number);
+    let base = pattern.replace("{name}", &stem).replace("{n}", &number);
     if ext.is_empty() {
         base
     } else {
@@ -3139,7 +3292,10 @@ fn rename_images(files: &[PathBuf], pattern: &str, start: usize) -> String {
         return "no images to rename".to_string();
     }
     let width = images.len().to_string().len();
-    let dir = images[0].parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let dir = images[0]
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
 
     let mut staged = Vec::new();
     for (i, path) in images.iter().enumerate() {
@@ -3183,10 +3339,10 @@ fn sheet_font() -> Option<&'static ab_glyph::FontVec> {
             "/usr/share/fonts/TTF/AdwaitaMono-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
         ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Ok(font) = ab_glyph::FontVec::try_from_vec(bytes) {
-                    return Some(font);
-                }
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(font) = ab_glyph::FontVec::try_from_vec(bytes)
+            {
+                return Some(font);
             }
         }
         None
@@ -3266,7 +3422,8 @@ fn draw_text(
                 let pixel = image.get_pixel_mut(px_x, px_y);
                 let alpha = coverage.clamp(0.0, 1.0);
                 for i in 0..3 {
-                    pixel.0[i] = (pixel.0[i] as f32 * (1.0 - alpha) + colour[i] as f32 * alpha) as u8;
+                    pixel.0[i] =
+                        (pixel.0[i] as f32 * (1.0 - alpha) + colour[i] as f32 * alpha) as u8;
                 }
                 pixel.0[3] = 255;
             });
@@ -3293,7 +3450,7 @@ fn build_sheet(files: &[PathBuf]) -> Option<(egui::ColorImage, usize)> {
 
     let cols = (count as f64).sqrt().ceil().max(1.0) as u32;
     let cols = cols.min(6);
-    let rows = ((count as u32) + cols - 1) / cols;
+    let rows = (count as u32).div_ceil(cols);
     let gap = 18;
     let width = cols * cell_w + gap * (cols + 1);
     let height = rows * cell_h + gap * (rows + 1);
@@ -3309,7 +3466,9 @@ fn build_sheet(files: &[PathBuf]) -> Option<(egui::ColorImage, usize)> {
             .iter()
             .flat_map(|p| [p.r(), p.g(), p.b(), p.a()])
             .collect();
-        let Some(source) = image::RgbaImage::from_raw(picture.width() as u32, picture.height() as u32, rgba) else {
+        let Some(source) =
+            image::RgbaImage::from_raw(picture.width() as u32, picture.height() as u32, rgba)
+        else {
             continue;
         };
         // Keep the picture's own proportions and centre it on the card: stretching
@@ -3439,7 +3598,11 @@ impl eframe::App for Peepin {
                 Ok((image, count)) => {
                     let texture =
                         ctx.load_texture("sheet", image.clone(), egui::TextureOptions::LINEAR);
-                    self.sheet = Some(Sheet { texture, image, count });
+                    self.sheet = Some(Sheet {
+                        texture,
+                        image,
+                        count,
+                    });
                     self.sheet_job = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -3456,9 +3619,8 @@ impl eframe::App for Peepin {
         }
         self.poll_video(ctx);
 
-        let quit = ctx.input(|i| {
-            (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Q)
-        });
+        let quit =
+            ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Q));
         if quit {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
@@ -3580,12 +3742,11 @@ impl eframe::App for Peepin {
                     }
                 }
             }
-        } else if primary_released {
-            if let Some((_, _, moved)) = self.left_drag.take() {
-                if !moved {
-                    self.step(ctx, self.left_button == Step::Next);
-                }
-            }
+        } else if primary_released
+            && let Some((_, _, moved)) = self.left_drag.take()
+            && !moved
+        {
+            self.step(ctx, self.left_button == Step::Next);
         }
         if clicked.1 && !over_bar {
             self.step(ctx, self.right_button == Step::Next);
@@ -3625,11 +3786,11 @@ impl eframe::App for Peepin {
             }
             size
         });
-        if resize != Vec2::ZERO {
-            if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
-                let size = (rect.size() + resize).max(Vec2::new(240.0, 160.0));
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-            }
+        if resize != Vec2::ZERO
+            && let Some(rect) = ctx.input(|i| i.viewport().inner_rect)
+        {
+            let size = (rect.size() + resize).max(Vec2::new(240.0, 160.0));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
         }
 
         // `r` reads the file again: the one feh has, for a picture that changed
@@ -3688,12 +3849,7 @@ fn window_icon() -> Option<egui::IconData> {
     // 128 square: one `XChangeProperty` can carry at most 262140 bytes, and a
     // 256 square icon is 262144.
     let size = 128u32;
-    let small = image::imageops::resize(
-        &image,
-        size,
-        size,
-        image::imageops::FilterType::Lanczos3,
-    );
+    let small = image::imageops::resize(&image, size, size, image::imageops::FilterType::Lanczos3);
     Some(egui::IconData {
         rgba: small.into_raw(),
         width: size,
@@ -3718,7 +3874,7 @@ fn set_window_icon(window: u64, icon: &egui::IconData) {
         let mut data: Vec<u64> = Vec::with_capacity(2 + icon.rgba.len() / 4);
         data.push(icon.width as u64);
         data.push(icon.height as u64);
-        for pixel in icon.rgba.chunks_exact(4) {
+        for pixel in icon.rgba.as_chunks::<4>().0 {
             data.push(
                 (pixel[3] as u64) << 24
                     | (pixel[0] as u64) << 16
@@ -3745,7 +3901,7 @@ fn x11_window_id(cc: &eframe::CreationContext<'_>) -> Option<u64> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = cc.window_handle().ok()?;
     match handle.as_raw() {
-        RawWindowHandle::Xlib(h) => Some(h.window as u64),
+        RawWindowHandle::Xlib(h) => Some(h.window),
         RawWindowHandle::Xcb(h) => Some(h.window.get() as u64),
         _ => None,
     }
@@ -3779,7 +3935,10 @@ pub struct Order {
 
 impl Default for Order {
     fn default() -> Self {
-        Self { kind: SortKind::Name, reverse: false }
+        Self {
+            kind: SortKind::Name,
+            reverse: false,
+        }
     }
 }
 
@@ -3823,7 +3982,12 @@ pub fn media_in(dir: &Path, order: Order) -> Vec<PathBuf> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase()
-            .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+            .cmp(
+                &b.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
     };
     match order.kind {
         SortKind::Name => files.sort_by(by_name),
@@ -3844,7 +4008,11 @@ pub fn media_in(dir: &Path, order: Order) -> Vec<PathBuf> {
         SortKind::Width | SortKind::Height => {
             let key = |p: &PathBuf| -> u32 {
                 let (width, height) = image::image_dimensions(p).unwrap_or((0, 0));
-                if order.kind == SortKind::Width { width } else { height }
+                if order.kind == SortKind::Width {
+                    width
+                } else {
+                    height
+                }
             };
             files.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| by_name(a, b)));
         }
@@ -3921,13 +4089,17 @@ fn decode_with_tool(path: &Path) -> Option<egui::ColorImage> {
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if ok && out.exists() {
-            if let Ok(image) = image::open(&out) {
-                let rgba = image.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let _ = std::fs::remove_file(&out);
-                return Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()));
-            }
+        if ok
+            && out.exists()
+            && let Ok(image) = image::open(&out)
+        {
+            let rgba = image.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let _ = std::fs::remove_file(&out);
+            return Some(egui::ColorImage::from_rgba_unmultiplied(
+                size,
+                rgba.as_raw(),
+            ));
         }
         let _ = std::fs::remove_file(&out);
     }
@@ -3935,10 +4107,11 @@ fn decode_with_tool(path: &Path) -> Option<egui::ColorImage> {
 }
 
 fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
-    if !has_ext(path, &["dds"]) && !image_ext_known(path) {
-        if let Some(image) = decode_with_tool(path) {
-            return Ok(image);
-        }
+    if !has_ext(path, &["dds"])
+        && !image_ext_known(path)
+        && let Some(image) = decode_with_tool(path)
+    {
+        return Ok(image);
     }
     let rgba = if has_ext(path, &["dds"]) {
         // Block-compressed surfaces (BC1-BC7) come through image_dds; anything
@@ -3965,7 +4138,10 @@ fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
         }
     };
     let size = [rgba.width() as usize, rgba.height() as usize];
-    Ok(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        size,
+        rgba.as_raw(),
+    ))
 }
 
 /// The extensions `image` itself decodes; anything else goes to a tool first.
@@ -3973,8 +4149,8 @@ fn image_ext_known(path: &Path) -> bool {
     has_ext(
         path,
         &[
-            "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr",
-            "exr", "dds", "ico", "pnm", "ff", "farbfeld", "avif",
+            "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr", "exr",
+            "dds", "ico", "pnm", "ff", "farbfeld", "avif",
         ],
     )
 }
@@ -3986,11 +4162,26 @@ fn selftest() {
         println!("usage: peepin --selftest <file>");
         return;
     };
+    // A folder of its own under the system's temp dir: a run leaves nothing
+    // beside the picture.
+    let out_dir = std::env::temp_dir().join("peepin-selftest");
+    let _ = std::fs::create_dir_all(&out_dir);
     match load_image(&path) {
         Ok(image) => {
-            println!("loaded {} ({}x{})", path.display(), image.width(), image.height());
-            for format in [Format::Png, Format::Jpeg, Format::Webp, Format::Bmp, Format::Tiff] {
-                let out = std::path::PathBuf::from(format!("/tmp/opencode/peepin-test.{}", format.ext()));
+            println!(
+                "loaded {} ({}x{})",
+                path.display(),
+                image.width(),
+                image.height()
+            );
+            for format in [
+                Format::Png,
+                Format::Jpeg,
+                Format::Webp,
+                Format::Bmp,
+                Format::Tiff,
+            ] {
+                let out = out_dir.join(format!("peepin-test.{}", format.ext()));
                 match write_image(&image, &out, format) {
                     Ok(()) => {
                         let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
@@ -4006,7 +4197,7 @@ fn selftest() {
     let files = media_in(&dir, Order::default());
     match build_sheet(&files) {
         Some((sheet, count)) => {
-            let out = std::path::PathBuf::from("/tmp/opencode/peepin-sheet.png");
+            let out = out_dir.join("peepin-sheet.png");
             match write_image(&sheet, &out, Format::Png) {
                 Ok(()) => println!(
                     "  sheet of {count} image(s) -> {} ({}x{})",
@@ -4021,7 +4212,7 @@ fn selftest() {
     }
 
     // Rename, in a throwaway copy so the real folder is untouched.
-    let scratch = std::path::PathBuf::from("/tmp/opencode/peepin-rename");
+    let scratch = out_dir.join("peepin-rename");
     let _ = std::fs::remove_dir_all(&scratch);
     if std::fs::create_dir_all(&scratch).is_ok() {
         let mut copies = Vec::new();
@@ -4077,7 +4268,12 @@ fn main() -> eframe::Result<()> {
 
     clean_old_mpv_sockets();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title(options.title.clone().unwrap_or_else(|| "peepin".to_string()))
+        .with_title(
+            options
+                .title
+                .clone()
+                .unwrap_or_else(|| "peepin".to_string()),
+        )
         .with_inner_size([960.0, 640.0])
         .with_transparent(true)
         .with_min_inner_size([240.0, 160.0]);

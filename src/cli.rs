@@ -67,7 +67,11 @@ pub enum Mode {
     Viewer,
     List,
     Info,
-    Screenshot { file: Option<PathBuf>, window: bool, delay: f64 },
+    Screenshot {
+        file: Option<PathBuf>,
+        window: bool,
+        delay: f64,
+    },
     Help,
     Version,
 }
@@ -158,7 +162,9 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
             continue;
         }
         let (flag, inline) = match arg.split_once('=') {
-            Some((flag, value)) if arg.starts_with("--") => (flag.to_string(), Some(value.to_string())),
+            Some((flag, value)) if arg.starts_with("--") => {
+                (flag.to_string(), Some(value.to_string()))
+            }
             _ => (arg.clone(), None),
         };
         let mut value = |name: &str| -> Result<String, String> {
@@ -217,13 +223,23 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
             "--sub-load" => options.sub_load = true,
             "--sub-menu" => options.sub_menu = true,
             "--seek" => {
-                options.seek = Some(value("--seek")?.parse().map_err(|_| "--seek wants seconds".to_string())?)
+                options.seek = Some(
+                    value("--seek")?
+                        .parse()
+                        .map_err(|_| "--seek wants seconds".to_string())?,
+                )
             }
             "--sub-cycle" => {
-                options.sub_cycle = value("--sub-cycle")?.parse().map_err(|_| "--sub-cycle wants a count".to_string())?
+                options.sub_cycle = value("--sub-cycle")?
+                    .parse()
+                    .map_err(|_| "--sub-cycle wants a count".to_string())?
             }
             "--sub-pick" => {
-                options.sub_pick = Some(value("--sub-pick")?.parse().map_err(|_| "--sub-pick wants a number".to_string())?)
+                options.sub_pick = Some(
+                    value("--sub-pick")?
+                        .parse()
+                        .map_err(|_| "--sub-pick wants a number".to_string())?,
+                )
             }
             other if other.starts_with('-') && other.len() > 1 => {
                 return Err(format!("{other} is not a flag peepin knows"));
@@ -237,7 +253,11 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
         // `peepin --screenshot file.png` and `--screenshot=file.png` both work;
         // a second free argument is the file when the flag came first.
         let file = shot_file.or_else(|| files.first().cloned());
-        options.mode = Mode::Screenshot { file, window, delay };
+        options.mode = Mode::Screenshot {
+            file,
+            window,
+            delay,
+        };
         options.path = None;
     } else if window || delay > 0.0 {
         return Err("--window and --delay belong to --screenshot".to_string());
@@ -259,7 +279,11 @@ pub fn run(options: &Options) -> Option<i32> {
         }
         Mode::List => Some(list(options, false)),
         Mode::Info => Some(list(options, true)),
-        Mode::Screenshot { file, window, delay } => Some(screenshot(file.clone(), *window, *delay)),
+        Mode::Screenshot {
+            file,
+            window,
+            delay,
+        } => Some(screenshot(file.clone(), *window, *delay)),
     }
 }
 
@@ -363,10 +387,9 @@ fn screenshot(file: Option<PathBuf>, window: bool, delay: f64) -> i32 {
         }
     };
     let mut png: Vec<u8> = Vec::new();
-    if let Err(err) = image::DynamicImage::ImageRgba8(pixels).write_to(
-        &mut std::io::Cursor::new(&mut png),
-        image::ImageFormat::Png,
-    ) {
+    if let Err(err) = image::DynamicImage::ImageRgba8(pixels)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    {
         eprintln!("peepin: {err}");
         return 1;
     }

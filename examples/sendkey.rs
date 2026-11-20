@@ -6,11 +6,11 @@ use x11rb::protocol::xproto::{ConnectionExt, KEY_PRESS_EVENT, KEY_RELEASE_EVENT}
 use x11rb::protocol::xtest::ConnectionExt as _;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let args = std::env::args().skip(1);
     let mut wid: Option<u32> = None;
     let mut title: Option<String> = None;
     let mut chord = "ctrl+o".to_string();
-    while let Some(arg) = args.next() {
+    for arg in args {
         if let Some(value) = arg.strip_prefix("--wid=") {
             wid = value.parse().ok();
         } else if let Some(value) = arg.strip_prefix("--title=") {
@@ -47,7 +47,11 @@ fn main() {
                 ch as u32
             }
         };
-        for (i, syms) in map.keysyms.chunks(map.keysyms_per_keycode as usize).enumerate() {
+        for (i, syms) in map
+            .keysyms
+            .chunks(map.keysyms_per_keycode as usize)
+            .enumerate()
+        {
             if syms.contains(&sym) {
                 return Some(min + i as u8);
             }
@@ -72,7 +76,14 @@ fn main() {
             let tree = conn.query_tree(window).ok()?.reply().ok()?;
             for child in tree.children {
                 let name = conn
-                    .get_property(false, child, x11rb::protocol::xproto::AtomEnum::WM_NAME, x11rb::protocol::xproto::AtomEnum::STRING, 0, 64)
+                    .get_property(
+                        false,
+                        child,
+                        x11rb::protocol::xproto::AtomEnum::WM_NAME,
+                        x11rb::protocol::xproto::AtomEnum::STRING,
+                        0,
+                        64,
+                    )
                     .ok()
                     .and_then(|c| c.reply().ok())
                     .map(|r| String::from_utf8_lossy(&r.value).into_owned())
@@ -99,7 +110,8 @@ fn main() {
     }
     if let Some(wid) = wid {
         use x11rb::protocol::xproto::InputFocus;
-        conn.set_input_focus(InputFocus::PARENT, wid, x11rb::CURRENT_TIME).ok();
+        conn.set_input_focus(InputFocus::PARENT, wid, x11rb::CURRENT_TIME)
+            .ok();
         conn.flush().ok();
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
