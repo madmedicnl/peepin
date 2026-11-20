@@ -62,10 +62,17 @@ mouse.right = next
 
 ## Formats
 
-Read, as pictures: **png, jpg/jpeg, gif** (first frame), **bmp, tga, tif/tiff,
-webp, qoi, hdr, exr, ico, pnm** (pbm/pgm/ppm/pam), **farbfeld/ff, avif** and
-**dds** — Fallout's textures, block-compressed BC1–BC7 through `image_dds`, with
-`image`'s own DDS reader as the fallback for uncompressed surfaces.
+Read by `image` itself: **png, jpg/jpeg, gif** (first frame), **bmp, tga,
+tif/tiff, webp, qoi, hdr, exr, ico, pnm** (pbm/pgm/ppm/pam), **farbfeld/ff, avif**
+and **dds** — Fallout's textures, block-compressed BC1–BC7 through `image_dds`,
+with `image`'s own DDS reader as the fallback for uncompressed surfaces.
+
+Read through a converter, the way IrfanView uses its plugins: **heic/heif, jxl,
+jp2/j2k, psd, pcx, xcf, wmf/emf, svg** and camera raw (**cr2, cr3, nef, arw, dng,
+orf, raf, rw2, pef, srw, 3fr, mrw**), plus **jxr/wdp/hdp**. These go through the
+first of `magick`, `heif-convert`, `djxl` or `vips` that is installed and succeeds,
+written to a temporary PNG and read back. Without those tools the formats simply
+report that they could not be read; the rest of the list does not depend on them.
 
 Read, as video (handed to mpv): **mp4, mkv, webm, avi, mov, m4v, wmv, flv, mpg,
 mpeg, ts, ogv**. mpv itself plays more, but these are the extensions peepin

@@ -18,8 +18,13 @@ use egui::{
 
 /// Everything `image` can open out of the box.
 const IMAGE_EXTS: &[&str] = &[
+    // what `image` reads itself
     "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr", "exr",
     "dds", "ico", "pnm", "ff", "farbfeld", "avif",
+    // and what the fallback decoders (below) cover
+    "heic", "heif", "jxl", "jp2", "j2k", "psd", "pcx", "xcf", "wmf", "emf", "svg",
+    "cr2", "cr3", "nef", "arw", "dng", "orf", "raf", "rw2", "pef", "srw", "3fr", "mrw",
+    "jxr", "wdp", "hdp",
 ];
 
 /// Handed to mpv.
@@ -2058,7 +2063,67 @@ fn blur_version(image: &egui::ColorImage) -> egui::ColorImage {
     )
 }
 
+/// Formats `image` does not read are handed to a converter that does — the same
+/// idea as IrfanView's plugins, using the tools already on the machine. The
+/// result comes back as a temporary PNG.
+fn decode_with_tool(path: &Path) -> Option<egui::ColorImage> {
+    use std::process::Command;
+    let out = std::env::temp_dir().join(format!("peepin-decode-{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    let mut attempts: Vec<Command> = Vec::new();
+
+    let mut magick = Command::new("magick");
+    magick
+        .arg(format!("{}[0]", path.display()))
+        .arg("-auto-orient")
+        .arg("-depth")
+        .arg("8")
+        .arg(&out);
+    attempts.push(magick);
+
+    let mut gm = Command::new("gm");
+    gm.arg("convert").arg(path).arg(&out);
+    attempts.push(gm);
+
+    let mut heif = Command::new("heif-convert");
+    heif.arg(path).arg(&out);
+    attempts.push(heif);
+
+    let mut djxl = Command::new("djxl");
+    djxl.arg(path).arg(&out);
+    attempts.push(djxl);
+
+    let mut vips = Command::new("vips");
+    vips.arg("copy").arg(path).arg(&out);
+    attempts.push(vips);
+
+    for mut attempt in attempts {
+        let ok = attempt
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if ok && out.exists() {
+            if let Ok(image) = image::open(&out) {
+                let rgba = image.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let _ = std::fs::remove_file(&out);
+                return Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()));
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+    None
+}
+
 fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
+    if !has_ext(path, &["dds"]) && !image_ext_known(path) {
+        if let Some(image) = decode_with_tool(path) {
+            return Ok(image);
+        }
+    }
     let rgba = if has_ext(path, &["dds"]) {
         // Block-compressed surfaces (BC1-BC7) come through image_dds; anything
         // else falls back to `image`'s own DDS reader.
@@ -2075,10 +2140,27 @@ fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
                 .to_rgba8(),
         }
     } else {
-        image::open(path).map_err(|e| e.to_string())?.to_rgba8()
+        match image::open(path) {
+            Ok(image) => image.to_rgba8(),
+            Err(native_error) => match decode_with_tool(path) {
+                Some(image) => return Ok(image),
+                None => return Err(native_error.to_string()),
+            },
+        }
     };
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// The extensions `image` itself decodes; anything else goes to a tool first.
+fn image_ext_known(path: &Path) -> bool {
+    has_ext(
+        path,
+        &[
+            "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr",
+            "exr", "dds", "ico", "pnm", "ff", "farbfeld", "avif",
+        ],
+    )
 }
 
 /// Exercise the code that needs no window: every save format, and the sheet.
