@@ -26,8 +26,8 @@ fitted into whatever space the window has.
 - **Contact sheet** `F3`: the whole folder as polaroids; `Ctrl+S` saves it.
 - **Batch rename** `F11`: `name-{n}`, with the first number typed in.
 - **Save as** `Ctrl+S`: png, jpg, webp, bmp or tiff.
-- **Screenshot** `p`: the window as it looks — picture, background, bars, video
-  included — written as a PNG beside the file.
+- **Screenshot** `p`, or `peepin --screenshot [FILE]` from a shell: the window
+  as it looks — picture, background, bars, video included — written as a PNG.
 - **Your colours**: it reads kitty's config, and `F2` edits the rest.
 
 ## What it needs
@@ -91,6 +91,52 @@ peepin ~/Pictures/photo.jpg  # that file, and ← → walk its folder
 peepin ~/Pictures            # the first picture in the folder
 ```
 
+## Command line
+
+`peepin` takes the flags feh has where the two programs do the same thing:
+
+| flag | what |
+|---|---|
+| `-g`, `--geometry WxH` | the window's size in points (the compositor may decide) |
+| `-F`, `--fullscreen` | start fullscreen |
+| `-Z`, `--zoom` | show the picture at 100 % instead of fitting it |
+| `-S`, `--sort KEY` | folder order: `name` (default), `size`, `mtime`, `width`, `height` |
+| `-r`, `--reverse` | walk the folder the other way |
+| `--start-at FILE` | start at that file instead of the first |
+| `-f`, `--filelist FILE` | the files to walk, one a line, instead of a folder |
+| `--title TEXT` | the window title |
+| `-l`, `--list` | print `name:width:height:format:size` per picture and exit |
+| `--info` | print one line per picture: `name WxH format size` |
+| `-v`, `--version`, `-h`, `--help` | the version and this list |
+
+`--list` and `--info` take files or folders and never open a window, which makes
+them usable in a pipe:
+
+```sh
+peepin --info ~/Pictures | sort -k3 -h        # the biggest pictures last
+peepin --list ~/Pictures/2026 | cut -d: -f2   # just the names
+```
+
+### Screenshot from the command line
+
+Like `scrot`, peepin can take the picture and leave:
+
+```sh
+peepin --screenshot                  # peepin-20261120-143512.png here
+peepin --screenshot out.png          # or wherever you say
+peepin --screenshot -u out.png       # the window that has the focus
+peepin --screenshot -d 3 out.png     # three seconds from now
+```
+
+The path it wrote is printed, so `p=$(peepin --screenshot)` works in a script. A
+name that exists is not overwritten: `-2`, `-3` and on are added.
+
+Under Wayland the screen is taken with **grim** when it is installed, because a
+compositor's own picture is the only one that shows every window. Without it —
+and always for `-u`, which reads an X11 window — peepin uses `XGetImage` itself,
+which cannot see windows that are not X11's. The path of the file is on stdout;
+anything wrong is on stderr with a non-zero exit status.
+
 ## Keys
 
 | key | what |
@@ -109,6 +155,7 @@ peepin ~/Pictures            # the first picture in the folder
 | `F11` | batch rename the images in the folder |
 | `b` | background: clear → blur → solid |
 | `p` | screenshot of the window, saved beside the file |
+| `r` | read the file again from disk |
 | `space` (video) | pause / play |
 | `↑` `↓` (video) | volume |
 | `m` (video) | mute |
@@ -231,6 +278,9 @@ children — are all in it, which makes it a good way to show what you see.
 That last part is also why it needs the X11 window peepin already opens for mpv:
 under a compositor without XWayland there is nothing to read and the bar says so.
 The PNG keeps the window's transparency, so a "clear" background stays clear.
+
+The same picture from a shell, without opening the viewer, is
+`peepin --screenshot [FILE]` — see [Command line](#command-line).
 
 ## Contact sheet (F3)
 

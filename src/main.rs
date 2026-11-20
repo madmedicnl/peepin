@@ -14,6 +14,8 @@
 //! version. It comes without any warranty; see the LICENSE file, or
 //! <https://www.gnu.org/licenses/>.
 
+mod cli;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -423,9 +425,92 @@ fn video_geometry(ctx: &egui::Context) -> Option<(i32, i32, u32, u32)> {
     Some((0, 0, width, height))
 }
 
+/// The whole screen, or the window that has the focus. `grim` is asked first
+/// when there is a Wayland session, because XWayland's root window cannot see
+/// windows that are not its own; the X11 read is the fallback.
+pub fn grab_screen(focused: bool) -> Option<image::RgbaImage> {
+    if !focused {
+        if let Some(pixels) = grim_screen() {
+            return Some(pixels);
+        }
+    }
+    let window = screen_window(focused)?;
+    capture_window(window)
+}
+
+/// `grim -` gives the compositor's own picture of the output.
+fn grim_screen() -> Option<image::RgbaImage> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return None;
+    }
+    let output = std::process::Command::new("grim")
+        .arg("-")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    image::load_from_memory(&output.stdout).ok().map(|image| image.to_rgba8())
+}
+
+/// The X11 window a screenshot reads: the root, or the top-level window that has
+/// the focus (X reports the focused child, so this walks up to the frame).
+fn screen_window(focused: bool) -> Option<u64> {
+    let xlib = x11_dl::xlib::Xlib::open().ok()?;
+    unsafe {
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            return None;
+        }
+        let root = (xlib.XDefaultRootWindow)(display);
+        let window = if focused { focused_top_level(&xlib, display, root) } else { Some(root) };
+        (xlib.XCloseDisplay)(display);
+        window
+    }
+}
+
+unsafe fn focused_top_level(
+    xlib: &x11_dl::xlib::Xlib,
+    display: *mut x11_dl::xlib::Display,
+    root: u64,
+) -> Option<u64> {
+    unsafe {
+        let mut focus: x11_dl::xlib::Window = 0;
+        let mut revert: std::ffi::c_int = 0;
+        (xlib.XGetInputFocus)(display, &mut focus, &mut revert);
+        if focus == 0 || focus == 1 || focus == root {
+            return None;
+        }
+        let mut window = focus;
+        for _ in 0..32 {
+            let mut root_return = 0;
+            let mut parent = 0;
+            let mut children: *mut x11_dl::xlib::Window = std::ptr::null_mut();
+            let mut count: std::ffi::c_uint = 0;
+            let ok = (xlib.XQueryTree)(
+                display,
+                window,
+                &mut root_return,
+                &mut parent,
+                &mut children,
+                &mut count,
+            );
+            if !children.is_null() {
+                (xlib.XFree)(children as *mut std::ffi::c_void);
+            }
+            if ok == 0 || parent == 0 || parent == root {
+                return Some(window);
+            }
+            window = parent;
+        }
+        Some(window)
+    }
+}
+
 /// `folder/name`, or `folder/stem-2.png` and on, so a second screenshot in the
 /// same second does not overwrite the first.
-fn free_name(folder: &Path, name: &str) -> PathBuf {
+pub(crate) fn free_name(folder: &Path, name: &str) -> PathBuf {
     let path = folder.join(name);
     if !path.exists() {
         return path;
@@ -445,7 +530,7 @@ fn free_name(folder: &Path, name: &str) -> PathBuf {
 }
 
 /// `20261120-143512`, in local time: the name a screenshot gets.
-fn stamp() -> String {
+pub(crate) fn stamp() -> String {
     // Local time, because that is what a person looks for in a folder listing.
     let mut now: libc::time_t = 0;
     let mut parts: libc::tm = unsafe { std::mem::zeroed() };
@@ -466,7 +551,7 @@ fn stamp() -> String {
 
 /// The window as it is on screen, as RGBA. `XGetImage` on our own window brings
 /// its children with it, so a video mpv draws inside is in the picture too.
-fn capture_window(window: u64) -> Option<image::RgbaImage> {
+pub(crate) fn capture_window(window: u64) -> Option<image::RgbaImage> {
     let xlib = x11_dl::xlib::Xlib::open().ok()?;
     unsafe {
         let display = (xlib.XOpenDisplay)(std::ptr::null());
@@ -729,6 +814,11 @@ struct Peepin {
     picker: Option<Pick>,
     /// Whether the picker shows thumbnails; remembered for the next time it opens.
     previews: bool,
+    /// How the folder is ordered (`--sort`, `--reverse`).
+    sort: SortKind,
+    reverse: bool,
+    /// Fit the picture to the window (the default) or show it at 100 %.
+    fit: bool,
     left_button: Step,
     right_button: Step,
     drag: Option<(Pos2, Vec2)>,
@@ -771,8 +861,6 @@ struct Peepin {
     video_note: Option<(String, Instant)>,
     /// A line shown in the status bar for a moment, e.g. where a screenshot went.
     note: Option<(String, Instant)>,
-    /// `--screenshot=<file>`: take one once the first frame is on screen.
-    screenshot_at: Option<(Instant, PathBuf)>,
     /// A video waiting for the window to be mapped.
     pending_video: Option<PathBuf>,
     palette: Palette,
@@ -804,14 +892,7 @@ impl Peepin {
         );
     }
 
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        arg: Option<PathBuf>,
-        open_picker_now: bool,
-        open_settings_now: bool,
-        open_sheet_now: bool,
-        previews_at_start: bool,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, options: cli::Options) -> Self {
         let palette = Palette::load();
 
         cc.egui_ctx.all_styles_mut(|style| {
@@ -825,9 +906,38 @@ impl Peepin {
             style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.dim);
         });
 
-        let (files, index) = match arg {
-            Some(path) => scan(&path),
-            None => (Vec::new(), 0),
+        let order = Order {
+            kind: match options.sort {
+                cli::Sort::Name => SortKind::Name,
+                cli::Sort::Size => SortKind::Size,
+                cli::Sort::Mtime => SortKind::Mtime,
+                cli::Sort::Width => SortKind::Width,
+                cli::Sort::Height => SortKind::Height,
+            },
+            reverse: options.reverse,
+        };
+        let (files, index) = if let Some(list) = &options.filelist {
+            let files = read_filelist(list);
+            let index = options
+                .start_at
+                .as_ref()
+                .and_then(|wanted| files.iter().position(|p| p == wanted))
+                .unwrap_or(0);
+            (files, index)
+        } else {
+            match &options.path {
+                Some(path) => {
+                    let (files, index) = scan(path, order);
+                    match &options.start_at {
+                        Some(wanted) => {
+                            let at = files.iter().position(|p| p == wanted).unwrap_or(index);
+                            (files, at)
+                        }
+                        None => (files, index),
+                    }
+                }
+                None => (Vec::new(), 0),
+            }
         };
 
         let mut app = Self {
@@ -840,7 +950,16 @@ impl Peepin {
             video: None,
             status: String::new(),
             picker: None,
-            previews: previews_at_start,
+            previews: options.previews,
+            sort: match options.sort {
+                cli::Sort::Name => SortKind::Name,
+                cli::Sort::Size => SortKind::Size,
+                cli::Sort::Mtime => SortKind::Mtime,
+                cli::Sort::Width => SortKind::Width,
+                cli::Sort::Height => SortKind::Height,
+            },
+            reverse: options.reverse,
+            fit: !options.zoom,
             left_button: Step::Previous,
             right_button: Step::Next,
             drag: None,
@@ -861,7 +980,6 @@ impl Peepin {
             sub_menu: false,
             video_note: None,
             note: None,
-            screenshot_at: None,
             pending_video: None,
             palette,
             background: Background::Transparent,
@@ -876,16 +994,29 @@ impl Peepin {
         }
         app.read_config();
         app.load(&cc.egui_ctx);
-        if open_picker_now {
+        if options.picker {
             app.open_picker();
-            app.previews = previews_at_start;
         }
-        if open_settings_now {
+        if options.settings {
             app.open_settings();
         }
-        if open_sheet_now {
+        if options.sheet {
             app.toggle_sheet(&cc.egui_ctx);
         }
+        if options.help_overlay {
+            app.overlay = Some(Overlay::Help);
+        }
+        if options.save_overlay {
+            app.open_save();
+        }
+        if options.rename_overlay {
+            app.open_rename();
+        }
+        app.seek_at_start = options.seek;
+        app.sub_load_at_start = options.sub_load;
+        app.sub_cycle_at_start = options.sub_cycle;
+        app.sub_pick_at_start = options.sub_pick;
+        app.sub_menu_at_start = options.sub_menu;
         app
     }
 
@@ -964,7 +1095,7 @@ impl Peepin {
         let Some(dir) = dir else {
             return;
         };
-        let files = media_in(&dir);
+        let files = media_in(&dir, self.order());
         if files.is_empty() {
             self.files.clear();
             self.index = 0;
@@ -2058,6 +2189,10 @@ impl Peepin {
         self.sub_load_at_start = false;
     }
 
+    fn order(&self) -> Order {
+        Order { kind: self.sort, reverse: self.reverse }
+    }
+
     fn step(&mut self, ctx: &egui::Context, forward: bool) {
         if self.files.is_empty() {
             return;
@@ -2177,14 +2312,14 @@ impl Peepin {
 
     fn open_path(&mut self, ctx: &egui::Context, path: PathBuf) {
         if path.is_dir() {
-            let (files, index) = scan(&path);
+            let (files, index) = scan(&path, self.order());
             self.files = files;
             self.index = index;
             self.load(ctx);
         } else if is_image(&path) || is_video(&path) {
             let dir = path.parent().map(|p| p.to_path_buf());
             let files = match &dir {
-                Some(dir) => media_in(dir),
+                Some(dir) => media_in(dir, self.order()),
                 None => vec![path.clone()],
             };
             self.files = files;
@@ -2700,9 +2835,13 @@ impl Peepin {
         let area = ui.max_rect();
         let area = Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 22.0));
 
-        let fit = (area.width() / self.image_size.x)
-            .min(area.height() / self.image_size.y)
-            .min(1.0);
+        let fit = if self.fit {
+            (area.width() / self.image_size.x)
+                .min(area.height() / self.image_size.y)
+                .min(1.0)
+        } else {
+            1.0
+        };
         let scale = fit * self.zoom;
         let size = self.image_size * scale;
         let centre = area.center() + self.pan;
@@ -2742,6 +2881,7 @@ const KEYS: &[(&str, &str)] = &[
     ("ctrl + ← → ↑ ↓", "resize the window"),
     ("b", "background: clear, blur, solid"),
     ("p", "screenshot of the window"),
+    ("r", "read the file again"),
     ("space (video)", "pause"),
     ("↑ ↓ (video)", "volume"),
     ("m / s (video)", "mute / next subtitle track"),
@@ -3278,14 +3418,6 @@ impl eframe::App for Peepin {
 
         // The window is on screen now, so the child window can be made and mpv
         // told where to draw.
-        if let Some((at, path)) = self.screenshot_at.clone() {
-            if at.elapsed() > Duration::from_millis(1200) {
-                self.screenshot_at = None;
-                if let Some(written) = self.screenshot(Some(path)) {
-                    eprintln!("screenshot: {}", written.display());
-                }
-            }
-        }
         if self.pending_video.is_some() {
             self.start_pending_video(ctx);
         }
@@ -3467,6 +3599,11 @@ impl eframe::App for Peepin {
             }
         }
 
+        // `r` reads the file again: the one feh has, for a picture that changed
+        // on disk while it is open.
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) && self.overlay.is_none() {
+            self.load(ctx);
+        }
         let plain_p = ctx.input(|i| {
             !(i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::P)
         });
@@ -3597,20 +3734,55 @@ fn config_path() -> PathBuf {
 }
 
 /// The files of a folder in name order, and the index of `path` in it.
-fn scan(path: &Path) -> (Vec<PathBuf>, usize) {
+/// How the files of a folder are ordered.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SortKind {
+    Name,
+    Size,
+    Mtime,
+    Width,
+    Height,
+}
+
+#[derive(Clone, Copy)]
+pub struct Order {
+    pub kind: SortKind,
+    pub reverse: bool,
+}
+
+impl Default for Order {
+    fn default() -> Self {
+        Self { kind: SortKind::Name, reverse: false }
+    }
+}
+
+pub fn scan(path: &Path, order: Order) -> (Vec<PathBuf>, usize) {
     if path.is_file() {
         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let mut files = media_in(&dir);
+        let mut files = media_in(&dir, order);
         let index = files.iter().position(|p| p == path).unwrap_or(0);
         if files.is_empty() {
             files.push(path.to_path_buf());
         }
         return (files, index);
     }
-    (media_in(path), 0)
+    (media_in(path, order), 0)
 }
 
-fn media_in(dir: &Path) -> Vec<PathBuf> {
+/// The files named by `--filelist`, one a line, kept in that order.
+fn read_filelist(path: &Path) -> Vec<PathBuf> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn media_in(dir: &Path, order: Order) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|read| {
             read.flatten()
@@ -3619,18 +3791,40 @@ fn media_in(dir: &Path) -> Vec<PathBuf> {
                 .collect()
         })
         .unwrap_or_default();
-    files.sort_by(|a, b| {
+    let by_name = |a: &PathBuf, b: &PathBuf| {
         a.file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase()
-            .cmp(
-                &b.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase(),
-            )
-    });
+            .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_lowercase())
+    };
+    match order.kind {
+        SortKind::Name => files.sort_by(by_name),
+        SortKind::Size | SortKind::Mtime => {
+            let key = |p: &PathBuf| -> u64 {
+                let meta = std::fs::metadata(p).ok();
+                match order.kind {
+                    SortKind::Size => meta.map(|m| m.len()).unwrap_or(0),
+                    _ => meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                }
+            };
+            files.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| by_name(a, b)));
+        }
+        SortKind::Width | SortKind::Height => {
+            let key = |p: &PathBuf| -> u32 {
+                let (width, height) = image::image_dimensions(p).unwrap_or((0, 0));
+                if order.kind == SortKind::Width { width } else { height }
+            };
+            files.sort_by(|a, b| key(a).cmp(&key(b)).then_with(|| by_name(a, b)));
+        }
+    }
+    if order.reverse {
+        files.reverse();
+    }
     files
 }
 
@@ -3782,7 +3976,7 @@ fn selftest() {
         Err(err) => println!("load failed: {err}"),
     }
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let files = media_in(&dir);
+    let files = media_in(&dir, Order::default());
     match build_sheet(&files) {
         Some((sheet, count)) => {
             let out = std::path::PathBuf::from("/tmp/opencode/peepin-sheet.png");
@@ -3826,6 +4020,12 @@ fn selftest() {
 }
 
 fn main() -> eframe::Result<()> {
+    // A closed pipe (`peepin --list | head`) should end the program, not panic
+    // in the middle of printing.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    // The two checks that print and leave, before anything touches a display.
     if std::env::args().any(|a| a == "--selftest") {
         selftest();
         return Ok(());
@@ -3834,84 +4034,49 @@ fn main() -> eframe::Result<()> {
         Peepin::palette_for_debug();
         return Ok(());
     }
-    let picker_at_start = std::env::args().any(|a| a == "--picker");
+
+    let options = match cli::parse(std::env::args().skip(1).collect()) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("peepin: {message}");
+            eprint!("{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
+    // `--list`, `--info`, `--screenshot`, `--help` and `--version` end here.
+    if let Some(code) = cli::run(&options) {
+        std::process::exit(code);
+    }
+
     clean_old_mpv_sockets();
-    let previews_at_start = std::env::args().any(|a| a == "--previews");
-    let settings_at_start = std::env::args().any(|a| a == "--settings");
-    let sheet_at_start = std::env::args().any(|a| a == "--sheet");
-    let help_at_start = std::env::args().any(|a| a == "--help-overlay");
-    let save_at_start = std::env::args().any(|a| a == "--save-overlay");
-    let rename_at_start = std::env::args().any(|a| a == "--rename-overlay");
-    let arg = std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .map(PathBuf::from);
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("peepin")
+        .with_title(options.title.clone().unwrap_or_else(|| "peepin".to_string()))
         .with_inner_size([960.0, 640.0])
         .with_transparent(true)
         .with_min_inner_size([240.0, 160.0]);
+    if let Some((width, height)) = options.geometry {
+        viewport = viewport.with_inner_size([width, height]);
+    }
+    if options.fullscreen {
+        viewport = viewport.with_fullscreen(true);
+    }
     if let Some(icon) = window_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
-    let mut options = eframe::NativeOptions {
+    let mut native = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
     // XWayland, so the window has an X11 id: that is what mpv needs to draw its
     // video inside peepin instead of opening a window of its own.
-    options.event_loop_builder = Some(Box::new(|builder| {
+    native.event_loop_builder = Some(Box::new(|builder| {
         use winit::platform::x11::EventLoopBuilderExtX11;
         builder.with_x11();
     }));
+    let for_app = options.clone();
     eframe::run_native(
         "peepin",
-        options,
-        Box::new(move |cc| {
-            let mut app = Peepin::new(
-                cc,
-                arg.clone(),
-                picker_at_start,
-                settings_at_start,
-                sheet_at_start,
-                previews_at_start,
-            );
-            if help_at_start {
-                app.overlay = Some(Overlay::Help);
-            }
-            if let Some(seconds) = std::env::args()
-                .find_map(|a| a.strip_prefix("--seek=").and_then(|v| v.parse::<f64>().ok()))
-            {
-                app.seek_at_start = Some(seconds);
-            }
-            if let Some(path) = std::env::args()
-                .find_map(|a| a.strip_prefix("--screenshot=").map(|p| p.to_string()))
-            {
-                app.screenshot_at = Some((Instant::now(), PathBuf::from(path)));
-            }
-            if std::env::args().any(|a| a == "--sub-load") {
-                app.sub_load_at_start = true;
-            }
-            if let Some(steps) = std::env::args()
-                .find_map(|a| a.strip_prefix("--sub-cycle=").and_then(|v| v.parse::<usize>().ok()))
-            {
-                app.sub_cycle_at_start = steps;
-            }
-            if let Some(number) = std::env::args()
-                .find_map(|a| a.strip_prefix("--sub-pick=").and_then(|v| v.parse::<usize>().ok()))
-            {
-                app.sub_pick_at_start = Some(number);
-            }
-            if std::env::args().any(|a| a == "--sub-menu") {
-                app.sub_menu_at_start = true;
-            }
-            if save_at_start {
-                app.open_save();
-            }
-            if rename_at_start {
-                app.open_rename();
-            }
-            Ok(Box::new(app))
-        }),
+        native,
+        Box::new(move |cc| Ok(Box::new(Peepin::new(cc, for_app)))),
     )
 }
