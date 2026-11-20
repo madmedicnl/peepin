@@ -2085,6 +2085,7 @@ dependencies = [
  "image_dds",
  "raw-window-handle",
  "winit",
+ "x11-dl",
  "x11rb",
 ]
 

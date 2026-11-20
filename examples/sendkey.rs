@@ -34,6 +34,14 @@ fn main() {
             "ctrl" | "control" => 0xffe3,
             "shift" => 0xffe1,
             "alt" => 0xffe9,
+            "space" => 0x0020,
+            "return" | "enter" => 0xff0d,
+            "tab" => 0xff09,
+            "escape" | "esc" => 0xff1b,
+            "up" => 0xff52,
+            "down" => 0xff54,
+            "left" => 0xff51,
+            "right" => 0xff53,
             other => {
                 let ch = other.chars().next()?;
                 ch as u32

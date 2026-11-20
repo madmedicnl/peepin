@@ -17,6 +17,7 @@ ddsfile = "0.5"
 ab_glyph = "0.2"
 winit = "0.30"
 raw-window-handle = "0.6"
+x11-dl = "2"
 
 [profile.release]
 opt-level = 2

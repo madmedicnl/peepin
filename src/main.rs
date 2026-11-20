@@ -8,8 +8,11 @@
 //! mpv, which draws inside this window; everything else goes through `image`,
 //! with `.dds` (Fallout's textures) through `image_dds`.
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{
@@ -31,6 +34,15 @@ const IMAGE_EXTS: &[&str] = &[
 const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "webm", "avi", "mov", "m4v", "wmv", "flv", "mpg", "mpeg", "ts", "ogv",
 ];
+
+/// Subtitle files peepin will offer for the video on screen.
+const SUBTITLE_EXTS: &[&str] = &["srt", "vtt", "ass", "ssa", "sub", "idx", "sup"];
+
+/// Height of the control bar under a video, in points.
+const VIDEO_BAR: f32 = 34.0;
+
+/// The most mpv will play at; the bar shows the same range.
+const MAX_VOLUME: f64 = 130.0;
 
 fn has_ext(path: &Path, set: &[&str]) -> bool {
     path.extension()
@@ -286,6 +298,249 @@ enum Overlay {
     Rename(RenameDialog),
 }
 
+/// What mpv last told us about the video on screen.
+#[derive(Default, Clone, Copy)]
+struct VideoState {
+    pos: f64,
+    duration: f64,
+    volume: f64,
+    paused: bool,
+    muted: bool,
+    /// Whether a subtitle track is selected (mpv says `sid` is `no` when not).
+    has_subs: bool,
+    /// Whether mpv would show it.
+    subs: bool,
+}
+
+/// A child window of our own that mpv is told to paint into with `--wid`.
+///
+/// `--wid` on our top-level window would let mpv cover the whole client area, so
+/// the control bar under the video could neither be seen nor clicked. Handing mpv
+/// a window that stops above the bar leaves the bar to peepin.
+struct VideoWindow {
+    xlib: x11_dl::xlib::Xlib,
+    display: *mut x11_dl::xlib::Display,
+    window: u64,
+    geometry: (i32, i32, u32, u32),
+    mapped: bool,
+}
+
+impl VideoWindow {
+    fn new(parent: u64, geometry: (i32, i32, u32, u32)) -> Option<Self> {
+        let xlib = x11_dl::xlib::Xlib::open().ok()?;
+        let display = unsafe { (xlib.XOpenDisplay)(std::ptr::null()) };
+        if display.is_null() {
+            return None;
+        }
+        let (x, y, width, height) = geometry;
+        let window = unsafe {
+            (xlib.XCreateSimpleWindow)(
+                display,
+                parent as x11_dl::xlib::Window,
+                x,
+                y,
+                width,
+                height,
+                0,
+                0,
+                0,
+            )
+        };
+        if window == 0 {
+            unsafe { (xlib.XCloseDisplay)(display) };
+            return None;
+        }
+        unsafe {
+            (xlib.XMapWindow)(display, window);
+            (xlib.XFlush)(display);
+        }
+        Some(Self { xlib, display, window, geometry, mapped: true })
+    }
+
+    /// Hide the video while a panel or the picker wants the window.
+    fn show(&mut self, show: bool) {
+        if self.mapped == show {
+            return;
+        }
+        unsafe {
+            if show {
+                (self.xlib.XMapWindow)(self.display, self.window);
+            } else {
+                (self.xlib.XUnmapWindow)(self.display, self.window);
+            }
+            (self.xlib.XFlush)(self.display);
+        }
+        self.mapped = show;
+    }
+
+    fn resize(&mut self, geometry: (i32, i32, u32, u32)) {
+        if self.geometry == geometry {
+            return;
+        }
+        let (x, y, width, height) = geometry;
+        unsafe {
+            (self.xlib.XMoveResizeWindow)(self.display, self.window, x, y, width, height);
+            (self.xlib.XFlush)(self.display);
+        }
+        self.geometry = geometry;
+    }
+}
+
+impl Drop for VideoWindow {
+    fn drop(&mut self) {
+        unsafe {
+            (self.xlib.XDestroyWindow)(self.display, self.window);
+            (self.xlib.XFlush)(self.display);
+            (self.xlib.XCloseDisplay)(self.display);
+        }
+    }
+}
+
+/// Where the video window goes: the client area, less the control bar.
+fn video_geometry(ctx: &egui::Context) -> Option<(i32, i32, u32, u32)> {
+    let rect = ctx.content_rect();
+    let ppp = ctx.pixels_per_point();
+    let width = (rect.width() * ppp).round().max(1.0) as u32;
+    let height = ((rect.height() - VIDEO_BAR) * ppp).round().max(1.0) as u32;
+    Some((0, 0, width, height))
+}
+
+/// mpv's IPC socket for this run.
+fn mpv_socket_path() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    base.join(format!("peepin-mpv-{}.sock", std::process::id()))
+}
+
+/// Sockets left behind by a peepin that was killed rather than closed: their
+/// process is gone, so the file can go too.
+fn clean_old_mpv_sockets() {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("peepin-mpv-") else {
+            continue;
+        };
+        let Some(pid) = rest.strip_suffix(".sock") else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+/// One command to mpv, as a JSON array, and its reply.
+fn mpv_send(socket: &Path, command: &[&str]) -> Option<String> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let mut line = String::from("{\"command\":[");
+    for (i, arg) in command.iter().enumerate() {
+        if i > 0 {
+            line.push(',');
+        }
+        line.push('"');
+        for c in arg.chars() {
+            match c {
+                '"' | '\\' => {
+                    line.push('\\');
+                    line.push(c);
+                }
+                '\n' => line.push_str("\\n"),
+                _ => line.push(c),
+            }
+        }
+        line.push('"');
+    }
+    line.push_str("]}\n");
+    stream.write_all(line.as_bytes()).ok()?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).ok()?;
+    Some(reply)
+}
+
+/// `{"data":42,"error":"success"}` -> `42`; `null` and arrays give nothing.
+fn data_field(reply: &str) -> Option<String> {
+    let at = reply.find("\"data\":")?;
+    let rest = reply[at + 7..].trim_start();
+    if rest.starts_with('[') || rest.starts_with('{') {
+        return None;
+    }
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        return Some(stripped[..end].to_string());
+    }
+    let end = rest.find(['}', ',']).unwrap_or(rest.len());
+    let value = rest[..end].trim();
+    if value.is_empty() || value == "null" {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn mpv_get(socket: &Path, property: &str) -> Option<String> {
+    let reply = mpv_send(socket, &["get_property", property])?;
+    data_field(&reply)
+}
+
+fn mpv_number(socket: &Path, property: &str) -> Option<f64> {
+    mpv_get(socket, property).and_then(|v| v.parse().ok())
+}
+
+impl VideoState {
+    /// Ask mpv where it is and how loud; six quick questions on a local socket.
+    fn update(&mut self, socket: &Path) {
+        if let Some(v) = mpv_number(socket, "time-pos") {
+            self.pos = v;
+        }
+        if let Some(v) = mpv_number(socket, "duration") {
+            self.duration = v;
+        }
+        if let Some(v) = mpv_number(socket, "volume") {
+            self.volume = v;
+        }
+        if let Some(v) = mpv_get(socket, "pause") {
+            self.paused = v == "true";
+        }
+        if let Some(v) = mpv_get(socket, "mute") {
+            self.muted = v == "true";
+        }
+        if let Some(v) = mpv_get(socket, "sub-visibility") {
+            self.subs = v == "true";
+        }
+        // `sid` is a number when a subtitle is selected, and `false` or `no`
+        // when there is none.
+        if let Some(v) = mpv_get(socket, "sid") {
+            self.has_subs = v.parse::<f64>().is_ok();
+        }
+    }
+}
+
+/// `83.4` -> `1:23`, and hours when the video has them.
+fn clock(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "--:--".to_string();
+    }
+    let total = seconds.round() as u64;
+    let (hours, minutes, secs) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes}:{secs:02}")
+    }
+}
+
 struct Peepin {
     files: Vec<PathBuf>,
     index: usize,
@@ -307,8 +562,23 @@ struct Peepin {
     /// X11 window id, when the window could be created through XWayland. mpv
     /// draws its video into that window with `--wid`.
     window_id: Option<u64>,
-    /// True while mpv owns the window: peepin then only listens for keys.
+    /// True while mpv draws into our window (through the child window below).
     embedded: bool,
+    /// Our own child window that mpv paints into, so the bar underneath it stays
+    /// visible and clickable.
+    video_window: Option<VideoWindow>,
+    /// mpv's IPC socket: the way peepin asks for volume, subtitles and seeking.
+    mpv_socket: Option<PathBuf>,
+    /// What mpv last told us about the video.
+    mpv: VideoState,
+    /// When mpv was last asked, so it is polled a few times a second.
+    mpv_polled: Option<Instant>,
+    /// When a seek was last sent, so dragging the bar does not flood mpv.
+    seek_sent: Option<Instant>,
+    /// `--seek=<seconds>`: jump there once the video is running.
+    seek_at_start: Option<f64>,
+    /// `--sub-load`: load the subtitle beside the video once it is running.
+    sub_load_at_start: bool,
     /// A video waiting for the window to be mapped.
     pending_video: Option<PathBuf>,
     palette: Palette,
@@ -383,6 +653,13 @@ impl Peepin {
             left_drag: None,
             window_id: x11_window_id(cc),
             embedded: false,
+            video_window: None,
+            mpv_socket: None,
+            mpv: VideoState::default(),
+            mpv_polled: None,
+            seek_sent: None,
+            seek_at_start: None,
+            sub_load_at_start: false,
             pending_video: None,
             palette,
             background: Background::Transparent,
@@ -954,7 +1231,7 @@ impl Peepin {
         }
     }
 
-    fn start_pending_video(&mut self) {
+    fn start_pending_video(&mut self, ctx: &egui::Context) {
         let Some(path) = self.pending_video.take() else {
             return;
         };
@@ -962,6 +1239,15 @@ impl Peepin {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // A window of our own, stopping above the control bar: mpv paints into it
+        // and the bar stays peepin's to draw and click.
+        self.video_window = match (self.window_id, video_geometry(ctx)) {
+            (Some(parent), Some(geometry)) => VideoWindow::new(parent, geometry),
+            _ => None,
+        };
+        let socket = mpv_socket_path();
+        let _ = std::fs::remove_file(&socket);
+
         let mut cmd = Command::new("mpv");
         // X11 explicitly: with WAYLAND_DISPLAY set, mpv would pick Wayland,
         // where `--wid` does not exist and it opens a window of its own.
@@ -977,10 +1263,12 @@ impl Peepin {
             .arg("--input-vo-keyboard=no")
             .arg("--input-cursor=no")
             .arg("--no-input-default-bindings")
-            .arg("--no-osd-bar");
-        let embedded = match self.window_id {
-            Some(id) => {
-                cmd.arg(format!("--wid={id}"));
+            .arg("--no-osd-bar")
+            // Volume, subtitles and seeking go through here, from the bar.
+            .arg(format!("--input-ipc-server={}", socket.display()));
+        let embedded = match self.video_window.as_ref() {
+            Some(window) => {
+                cmd.arg(format!("--wid={}", window.window));
                 true
             }
             None => {
@@ -993,13 +1281,309 @@ impl Peepin {
             Ok(child) => {
                 self.video = Some(child);
                 self.embedded = embedded;
+                self.mpv_socket = Some(socket);
+                self.mpv = VideoState { volume: 100.0, ..VideoState::default() };
+                self.mpv_polled = None;
                 self.status = if embedded {
                     format!("▶ {name}  (mpv, embedded)")
                 } else {
                     format!("▶ {name}  (mpv)")
                 };
             }
-            Err(err) => self.status = format!("mpv: {err}"),
+            Err(err) => {
+                self.video_window = None;
+                self.status = format!("mpv: {err}");
+            }
+        }
+    }
+
+    /// A command for mpv, over its socket.
+    fn mpv_command(&self, command: &[&str]) -> Option<String> {
+        self.mpv_socket.as_ref().and_then(|s| mpv_send(s, command))
+    }
+
+    fn seek_to(&mut self, target: f64) {
+        if self.mpv.duration <= 0.0 {
+            return;
+        }
+        let target = target.clamp(0.0, self.mpv.duration);
+        self.mpv.pos = target;
+        let now = Instant::now();
+        if self
+            .seek_sent
+            .map(|t| now.duration_since(t) < Duration::from_millis(120))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.seek_sent = Some(now);
+        let value = format!("{target:.3}");
+        self.mpv_command(&["seek", &value, "absolute+exact"]);
+    }
+
+    fn set_volume(&mut self, volume: f64) {
+        let volume = volume.clamp(0.0, MAX_VOLUME);
+        self.mpv.volume = volume;
+        let value = format!("{volume:.0}");
+        self.mpv_command(&["set_property", "volume", &value]);
+    }
+
+    fn toggle_subs(&mut self) {
+        let on = !self.mpv.subs;
+        self.mpv.subs = on;
+        self.mpv_command(&["set_property", "sub-visibility", if on { "yes" } else { "no" }]);
+    }
+
+    /// Load a subtitle file: the one named after the video if there is one, else
+    /// the first subtitle in the folder.
+    fn load_subtitle(&mut self) {
+        let Some(video) = self.files.get(self.index).cloned() else {
+            return;
+        };
+        let Some(dir) = video.parent() else {
+            return;
+        };
+        let stem = video.file_stem().map(|s| s.to_owned()).unwrap_or_default();
+        let mut names: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|read| {
+                read.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_file() && has_ext(p, SUBTITLE_EXTS))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        let same = names
+            .iter()
+            .find(|p| p.file_stem() == Some(stem.as_os_str()))
+            .cloned();
+        match same.or_else(|| names.first().cloned()) {
+            Some(path) => {
+                let text = path.to_string_lossy().into_owned();
+                self.mpv_command(&["sub-add", &text, "select"]);
+                self.mpv_command(&["set_property", "sub-visibility", "yes"]);
+                self.mpv.subs = true;
+                self.status = format!(
+                    "subs: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            None => self.status = "no subtitle file in this folder".to_string(),
+        }
+    }
+
+    /// Keep the child window over the video area, follow a resize, and ask mpv
+    /// where it is a few times a second.
+    fn poll_video(&mut self, ctx: &egui::Context) {
+        if self.video.is_none() {
+            return;
+        }
+        if let Some(child) = self.video.as_mut() {
+            if let Ok(Some(_)) = child.try_wait() {
+                self.stop_video();
+                self.status = "video stopped".to_string();
+                return;
+            }
+        }
+        // A panel or the picker wants the whole window for a moment.
+        let covered = self.overlay.is_some() || self.picker.is_some();
+        if let Some(window) = self.video_window.as_mut() {
+            window.show(!covered);
+            if let Some(geometry) = video_geometry(ctx) {
+                window.resize(geometry);
+            }
+        }
+        let due = self
+            .mpv_polled
+            .map(|t| t.elapsed() > Duration::from_millis(200))
+            .unwrap_or(true);
+        if due {
+            if let Some(socket) = self.mpv_socket.clone() {
+                self.mpv.update(&socket);
+            }
+            self.mpv_polled = Some(Instant::now());
+        }
+        // Test hooks: a start-up seek and a subtitle load, once mpv is running.
+        if let Some(seconds) = self.seek_at_start {
+            if self.mpv.duration > 0.0 {
+                self.seek_at_start = None;
+                self.seek_to(seconds);
+            }
+        }
+        if self.sub_load_at_start && self.mpv.duration > 0.0 {
+            self.sub_load_at_start = false;
+            self.load_subtitle();
+        }
+    }
+
+    /// The keys that belong to a playing video.
+    fn video_keys(&mut self, ctx: &egui::Context) {
+        let (space, up, down, mute, subs, load) = ctx.input(|i| {
+            let plain = !(i.modifiers.command || i.modifiers.ctrl);
+            (
+                plain && i.key_pressed(egui::Key::Space),
+                plain && i.key_pressed(egui::Key::ArrowUp),
+                plain && i.key_pressed(egui::Key::ArrowDown),
+                plain && i.key_pressed(egui::Key::M),
+                plain && i.key_pressed(egui::Key::S),
+                plain && i.key_pressed(egui::Key::L),
+            )
+        });
+        if space {
+            self.mpv_command(&["cycle", "pause"]);
+            self.mpv.paused = !self.mpv.paused;
+        }
+        if up {
+            self.set_volume(self.mpv.volume + 5.0);
+        }
+        if down {
+            self.set_volume(self.mpv.volume - 5.0);
+        }
+        if mute {
+            self.mpv_command(&["cycle", "mute"]);
+            self.mpv.muted = !self.mpv.muted;
+        }
+        if subs {
+            self.toggle_subs();
+        }
+        if load {
+            self.load_subtitle();
+        }
+    }
+
+    /// The bar under a video: name, seek, clock, pause, mute, volume, subtitles.
+    fn video_bar(&mut self, ui: &mut egui::Ui) {
+        let palette = self.palette;
+        let area = ui.max_rect();
+        let bar = Rect::from_min_max(
+            Pos2::new(area.left(), area.bottom() - VIDEO_BAR),
+            area.max,
+        );
+        ui.painter().rect_filled(bar, 0.0, palette.bg);
+        ui.painter().line_segment(
+            [Pos2::new(bar.left(), bar.top()), Pos2::new(bar.right(), bar.top())],
+            Stroke::new(1.0, palette.dim),
+        );
+
+        let centre = bar.center().y;
+        let pad = 8.0;
+        let chip_h = 20.0;
+        let chip_at = |right: f32, width: f32| {
+            Rect::from_min_size(
+                Pos2::new(right - width, centre - chip_h / 2.0),
+                Vec2::new(width, chip_h),
+            )
+        };
+        let load = chip_at(bar.right() - pad, 30.0);
+        let subs = chip_at(load.left() - 5.0, 24.0);
+        let mute = chip_at(subs.left() - 5.0, 24.0);
+        let pause = chip_at(mute.left() - 5.0, 24.0);
+        let vol_number = Rect::from_min_size(
+            Pos2::new(pause.left() - 42.0, centre - 8.0),
+            Vec2::new(40.0, 16.0),
+        );
+        let vol = Rect::from_min_size(
+            Pos2::new(vol_number.left() - 82.0, centre - 5.0),
+            Vec2::new(78.0, 10.0),
+        );
+        let clock_rect = Rect::from_min_size(
+            Pos2::new(vol.left() - 104.0, centre - 8.0),
+            Vec2::new(100.0, 16.0),
+        );
+        let name_room = (clock_rect.left() - bar.left() - 2.0 * pad).max(60.0);
+        let name_rect = Rect::from_min_size(
+            Pos2::new(bar.left() + pad, centre - 8.0),
+            Vec2::new(name_room * 0.34, 16.0),
+        );
+        let seek = Rect::from_min_max(
+            Pos2::new(name_rect.right() + 8.0, centre - 5.0),
+            Pos2::new(clock_rect.left() - 8.0, centre + 5.0),
+        );
+
+        let name = self
+            .files
+            .get(self.index)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        ui.painter().text(
+            name_rect.left_top(),
+            Align2::LEFT_TOP,
+            shorten(&name, 30),
+            FontId::monospace(12.0),
+            palette.fg,
+        );
+        ui.painter().text(
+            clock_rect.right_top(),
+            Align2::RIGHT_TOP,
+            format!("{} / {}", clock(self.mpv.pos), clock(self.mpv.duration)),
+            FontId::monospace(12.0),
+            palette.dim,
+        );
+
+        // The two bars: position and volume.
+        let position = if self.mpv.duration > 0.0 {
+            (self.mpv.pos / self.mpv.duration).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        paint_bar(ui, seek, position as f32, palette);
+        paint_bar(ui, vol, (self.mpv.volume / MAX_VOLUME) as f32, palette);
+        ui.painter().text(
+            vol_number.right_top(),
+            Align2::RIGHT_TOP,
+            format!("{:.0}", self.mpv.volume),
+            FontId::monospace(12.0),
+            palette.dim,
+        );
+
+        // Chips: pause, mute, subtitles, load subtitles.
+        paint_chip(ui, pause, if self.mpv.paused { "▶" } else { "||" }, false, palette);
+        paint_chip(ui, mute, "m", self.mpv.muted, palette);
+        paint_chip(ui, subs, "sub", self.mpv.subs && self.mpv.has_subs, palette);
+        paint_chip(ui, load, "srt", false, palette);
+
+        let pause_hit = ui.interact(pause, egui::Id::new("video-pause"), egui::Sense::click());
+        if pause_hit.clicked() {
+            self.mpv_command(&["cycle", "pause"]);
+            self.mpv.paused = !self.mpv.paused;
+        }
+        let mute_hit = ui.interact(mute, egui::Id::new("video-mute"), egui::Sense::click());
+        if mute_hit.clicked() {
+            self.mpv_command(&["cycle", "mute"]);
+            self.mpv.muted = !self.mpv.muted;
+        }
+        let subs_hit = ui.interact(subs, egui::Id::new("video-subs"), egui::Sense::click());
+        if subs_hit.clicked() {
+            self.toggle_subs();
+        }
+        let load_hit = ui.interact(load, egui::Id::new("video-load"), egui::Sense::click());
+        if load_hit.clicked() {
+            self.load_subtitle();
+        }
+
+        let seek_hit = ui.interact(seek, egui::Id::new("video-seek"), egui::Sense::click_and_drag());
+        if seek_hit.dragged() || seek_hit.clicked() {
+            if let Some(point) = seek_hit.interact_pointer_pos() {
+                let fraction = ((point.x - seek.left()) / seek.width()).clamp(0.0, 1.0);
+                self.seek_to(fraction as f64 * self.mpv.duration);
+            }
+        }
+        let vol_hit = ui.interact(vol, egui::Id::new("video-volume"), egui::Sense::click_and_drag());
+        if vol_hit.dragged() || vol_hit.clicked() {
+            if let Some(point) = vol_hit.interact_pointer_pos() {
+                let fraction = ((point.x - vol.left()) / vol.width()).clamp(0.0, 1.0);
+                self.set_volume(fraction as f64 * MAX_VOLUME);
+            }
+        }
+
+        // The wheel over the bar is volume, the way a terminal player does it.
+        let (hover, wheel) = ui.ctx().input(|i| (i.pointer.hover_pos(), i.smooth_scroll_delta.y));
+        if let Some(point) = hover {
+            if bar.contains(point) && wheel.abs() > 0.5 && !vol_hit.dragged() {
+                let step = if wheel > 0.0 { 3.0 } else { -3.0 };
+                self.set_volume(self.mpv.volume + step);
+            }
         }
     }
 
@@ -1010,6 +1594,16 @@ impl Peepin {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // The window goes after mpv: its own window lives inside ours.
+        self.video_window = None;
+        if let Some(socket) = self.mpv_socket.take() {
+            let _ = std::fs::remove_file(socket);
+        }
+        self.mpv = VideoState::default();
+        self.mpv_polled = None;
+        self.seek_sent = None;
+        self.seek_at_start = None;
+        self.sub_load_at_start = false;
     }
 
     fn step(&mut self, ctx: &egui::Context, forward: bool) {
@@ -1652,6 +2246,10 @@ const KEYS: &[(&str, &str)] = &[
     ("0", "fit to window again"),
     ("ctrl + ← → ↑ ↓", "resize the window"),
     ("b", "background: clear, blur, solid"),
+    ("space (video)", "pause"),
+    ("↑ ↓ (video)", "volume"),
+    ("m / s (video)", "mute / subtitles off and on"),
+    ("srt (video)", "load a subtitle from this folder"),
     ("ctrl+o", "open: folders left, files right"),
     ("v in the picker", "thumbnails beside the names"),
     ("ctrl+s", "save as (format of your choice)"),
@@ -1714,6 +2312,41 @@ fn thumbnail(image: &egui::ColorImage, w: u32, h: u32) -> egui::ColorImage {
     let cropped =
         image::imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw())
+}
+
+/// A thin bar with a filled part: the seek position and the volume.
+fn paint_bar(ui: &egui::Ui, rect: Rect, fraction: f32, palette: Palette) {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 6.0));
+    ui.painter().rect_filled(track, 1.0, palette.dim.gamma_multiply(0.45));
+    let filled = Rect::from_min_max(
+        track.min,
+        Pos2::new(track.left() + track.width() * fraction, track.bottom()),
+    );
+    ui.painter().rect_filled(filled, 1.0, palette.accent);
+    let caret = Rect::from_center_size(
+        Pos2::new(filled.right(), track.center().y),
+        Vec2::new(3.0, track.height() + 4.0),
+    );
+    ui.painter().rect_filled(caret, 1.0, palette.fg);
+}
+
+/// One of the small toggles on the video bar.
+fn paint_chip(ui: &egui::Ui, rect: Rect, text: &str, active: bool, palette: Palette) {
+    let (fill, colour) = if active {
+        (palette.accent, palette.bg)
+    } else {
+        (palette.bg, palette.fg)
+    };
+    ui.painter().rect_filled(rect, 2.0, fill);
+    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::monospace(12.0),
+        colour,
+    );
 }
 
 /// A row of the panels: a button that reads like a terminal toggle.
@@ -2076,8 +2709,9 @@ impl eframe::App for Peepin {
         // The window is on screen now, so the child window can be made and mpv
         // told where to draw.
         if self.pending_video.is_some() {
-            self.start_pending_video();
+            self.start_pending_video(ctx);
         }
+        self.poll_video(ctx);
 
         let quit = ctx.input(|i| {
             (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Q)
@@ -2154,14 +2788,20 @@ impl eframe::App for Peepin {
         if right {
             self.step(ctx, true);
         }
-        if up {
-            self.zoom_by(1.25);
-        }
-        if down {
-            self.zoom_by(0.8);
-        }
-        if wheel.abs() > 0.5 {
-            self.zoom_by(if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 });
+        if self.video.is_some() {
+            // A video has nothing to zoom: the arrows and the wheel are the
+            // volume, and the bar's own keys live in `video_keys`.
+            self.video_keys(ctx);
+        } else {
+            if up {
+                self.zoom_by(1.25);
+            }
+            if down {
+                self.zoom_by(0.8);
+            }
+            if wheel.abs() > 0.5 {
+                self.zoom_by(if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 });
+            }
         }
         // The left button both steps and pans: a click (no movement) goes to the
         // next file, a drag moves the zoomed picture.
@@ -2172,7 +2812,14 @@ impl eframe::App for Peepin {
                 i.pointer.interact_pos(),
             )
         });
-        if primary_down {
+        let over_bar = self.embedded
+            && ctx
+                .input(|i| i.pointer.interact_pos())
+                .map(|p| p.y > ctx.content_rect().bottom() - VIDEO_BAR)
+                .unwrap_or(false);
+        if over_bar {
+            self.left_drag = None;
+        } else if primary_down {
             match self.left_drag {
                 None => {
                     self.left_drag = Some((pointer.unwrap_or_default(), self.pan, false));
@@ -2197,7 +2844,7 @@ impl eframe::App for Peepin {
                 }
             }
         }
-        if clicked.1 {
+        if clicked.1 && !over_bar {
             self.step(ctx, self.right_button == Step::Next);
         }
 
@@ -2255,7 +2902,10 @@ impl eframe::App for Peepin {
         }
 
         if self.embedded {
-            // mpv is drawing over the window; painting here would erase it.
+            // mpv paints in its own child window; what is left to us is the bar
+            // underneath it.
+            self.video_bar(ui);
+            ctx.request_repaint_after(std::time::Duration::from_millis(60));
             return;
         }
         self.draw_background(ui);
@@ -2540,6 +3190,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let picker_at_start = std::env::args().any(|a| a == "--picker");
+    clean_old_mpv_sockets();
     let previews_at_start = std::env::args().any(|a| a == "--previews");
     let settings_at_start = std::env::args().any(|a| a == "--settings");
     let sheet_at_start = std::env::args().any(|a| a == "--sheet");
@@ -2578,6 +3229,14 @@ fn main() -> eframe::Result<()> {
             );
             if help_at_start {
                 app.overlay = Some(Overlay::Help);
+            }
+            if let Some(seconds) = std::env::args()
+                .find_map(|a| a.strip_prefix("--seek=").and_then(|v| v.parse::<f64>().ok()))
+            {
+                app.seek_at_start = Some(seconds);
+            }
+            if std::env::args().any(|a| a == "--sub-load") {
+                app.sub_load_at_start = true;
             }
             if save_at_start {
                 app.open_save();

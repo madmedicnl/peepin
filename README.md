@@ -36,12 +36,41 @@ peepin ~/Pictures            # opens the first image in the folder
 | `F3` | contact sheet of the folder, as polaroids |
 | `F11` | batch rename the images in the folder |
 | `b` | background: clear → blur → solid |
+| `space` (video) | pause / play |
+| `↑` `↓` (video) | volume |
+| `m` (video) | mute |
+| `s` (video) | subtitles off / on |
+| `l` (video) | load a subtitle from the folder |
 | `Ctrl+Q` | quit |
 
-Videos (mp4, mkv, webm, avi, mov, …) are handed to **mpv** in its own window and
-loop; images go through `image` (png, jpg, gif, bmp, tga, tiff, webp, qoi, hdr,
-exr, ico, pnm) with `.dds` decoded through `image_dds` (BC1–BC7, Fallout's
-textures included).
+Videos (mp4, mkv, webm, avi, mov, …) are handed to **mpv**, which draws them
+inside peepin's own window, and loop; images go through `image` (png, jpg, gif,
+bmp, tga, tiff, webp, qoi, hdr, exr, ico, pnm) with `.dds` decoded through
+`image_dds` (BC1–BC7, Fallout's textures included).
+
+## Video (mpv)
+
+The video gets a child window of peepin's own that stops just above the bottom
+edge, and the bar under it is peepin's to draw. That bar has, from the left:
+
+| in the bar | what |
+|---|---|
+| the file name | |
+| the seek bar | drag or click to jump; the clock is on its right |
+| `\|\|` / `▶` | pause and play (`space`) |
+| `m` | mute, lit while muted |
+| `sub` | subtitles off and on, lit while they show |
+| `srt` | load a subtitle from this folder: the one named after the video if there is one, else the first `.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`, `.idx`, `.sup` |
+| the volume bar | drag or click; the wheel over the bar does it too, and `↑` `↓`; 100 is mpv's normal level, up to 130 |
+| a number | the volume in percent |
+
+It all goes through mpv's IPC socket in `$XDG_RUNTIME_DIR` (removed with the
+video), which is also why mpv keeps no keyboard and no mouse of its own. mpv
+already loads a subtitle with the video's exact name; `srt` is for the ones named
+differently.
+
+Without XWayland there is no window of ours to give mpv: the video then opens in
+a window of its own, the bar is not there, and the keys still work.
 
 ## Mouse buttons
 
