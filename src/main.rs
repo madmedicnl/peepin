@@ -19,7 +19,7 @@ use egui::{
 /// Everything `image` can open out of the box.
 const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "tga", "tif", "tiff", "webp", "qoi", "hdr", "exr",
-    "dds", "ico", "pnm", "ff", "farbfeld",
+    "dds", "ico", "pnm", "ff", "farbfeld", "avif",
 ];
 
 /// Handed to mpv.
@@ -1881,7 +1881,9 @@ impl eframe::App for Peepin {
                     if let Some(now) = pointer {
                         let delta = now - start;
                         let moved = moved || delta.length() > 4.0;
-                        if moved {
+                        // Only a zoomed picture is dragged: at "fit" there is
+                        // nothing outside the window to move to.
+                        if moved && self.zoom > 1.0 {
                             self.pan = from + delta;
                         }
                         self.left_drag = Some((start, from, moved));
@@ -2058,10 +2060,20 @@ fn blur_version(image: &egui::ColorImage) -> egui::ColorImage {
 
 fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
     let rgba = if has_ext(path, &["dds"]) {
-        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut reader = std::io::BufReader::new(file);
-        let dds = ddsfile::Dds::read(&mut reader).map_err(|e| format!("dds: {e}"))?;
-        image_dds::image_from_dds(&dds, 0).map_err(|e| format!("dds: {e}"))?
+        // Block-compressed surfaces (BC1-BC7) come through image_dds; anything
+        // else falls back to `image`'s own DDS reader.
+        let decoded = (|| {
+            let file = std::fs::File::open(path).ok()?;
+            let mut reader = std::io::BufReader::new(file);
+            let dds = ddsfile::Dds::read(&mut reader).ok()?;
+            image_dds::image_from_dds(&dds, 0).ok()
+        })();
+        match decoded {
+            Some(image) => image,
+            None => image::open(path)
+                .map_err(|e| format!("dds: {e}"))?
+                .to_rgba8(),
+        }
     } else {
         image::open(path).map_err(|e| e.to_string())?.to_rgba8()
     };

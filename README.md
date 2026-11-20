@@ -60,6 +60,22 @@ mouse.right = next
 - Zoom is relative to "fit", so `zoom 100%` means the picture exactly fills the
   window; it re-fits when you resize.
 
+## Formats
+
+Read, as pictures: **png, jpg/jpeg, gif** (first frame), **bmp, tga, tif/tiff,
+webp, qoi, hdr, exr, ico, pnm** (pbm/pgm/ppm/pam), **farbfeld/ff, avif** and
+**dds** — Fallout's textures, block-compressed BC1–BC7 through `image_dds`, with
+`image`'s own DDS reader as the fallback for uncompressed surfaces.
+
+Read, as video (handed to mpv): **mp4, mkv, webm, avi, mov, m4v, wmv, flv, mpg,
+mpeg, ts, ogv**. mpv itself plays more, but these are the extensions peepin
+recognises; one line in `VIDEO_EXTS` adds another.
+
+Written by Ctrl+S: **png, jpg** (quality 92, alpha on white), **webp** (lossless),
+**bmp**, **tiff**.
+
+Only a zoomed picture is dragged: at "fit" the left button is just the next file.
+
 ## Background
 
 Three modes, `b` cycles them, `~/.config/peepin/peepin.conf` sets the one it
