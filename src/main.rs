@@ -221,6 +221,58 @@ impl Settings {
     }
 }
 
+/// Formats the save dialog can write.
+#[derive(Clone, Copy, PartialEq)]
+enum Format {
+    Png,
+    Jpeg,
+    Webp,
+    Bmp,
+    Tiff,
+}
+
+impl Format {
+    fn ext(self) -> &'static str {
+        match self {
+            Format::Png => "png",
+            Format::Jpeg => "jpg",
+            Format::Webp => "webp",
+            Format::Bmp => "bmp",
+            Format::Tiff => "tiff",
+        }
+    }
+}
+
+/// Ctrl+S: where to write the picture, and in what format.
+struct SaveDialog {
+    dir: String,
+    name: String,
+    format: Format,
+    note: String,
+}
+
+/// F3: the contact sheet, already rendered as a picture so Ctrl+S can save it.
+struct Sheet {
+    texture: egui::TextureHandle,
+    image: egui::ColorImage,
+    count: usize,
+}
+
+/// F11: batch rename of the images in the folder.
+struct RenameDialog {
+    pattern: String,
+    start: usize,
+    note: String,
+}
+
+/// The panels that sit over the picture.
+enum Overlay {
+    Help,
+    Settings(Settings),
+    Save(SaveDialog),
+    Rename(RenameDialog),
+}
+
 struct Peepin {
     files: Vec<PathBuf>,
     index: usize,
@@ -246,8 +298,12 @@ struct Peepin {
     /// A small, blurred copy of the current picture, stretched over the window in
     /// `Background::Blur`.
     blur: Option<egui::TextureHandle>,
-    /// The F1 panel, when it is open.
-    settings: Option<Settings>,
+    /// The picture as decoded, so Ctrl+S writes it at its own size.
+    source: Option<egui::ColorImage>,
+    /// The panel that is open: help, settings, save or rename.
+    overlay: Option<Overlay>,
+    /// The contact sheet built by F3, until the next file is shown.
+    sheet: Option<Sheet>,
 }
 
 
@@ -269,6 +325,7 @@ impl Peepin {
         arg: Option<PathBuf>,
         open_picker_now: bool,
         open_settings_now: bool,
+        open_sheet_now: bool,
     ) -> Self {
         let palette = Palette::load();
 
@@ -307,7 +364,9 @@ impl Peepin {
             palette,
             background: Background::Transparent,
             blur: None,
-            settings: None,
+            source: None,
+            overlay: None,
+            sheet: None,
         };
         app.read_config();
         app.load(&cc.egui_ctx);
@@ -316,6 +375,9 @@ impl Peepin {
         }
         if open_settings_now {
             app.open_settings();
+        }
+        if open_sheet_now {
+            app.toggle_sheet(&cc.egui_ctx);
         }
         app
     }
@@ -331,15 +393,64 @@ impl Peepin {
     }
 
     fn open_settings(&mut self) {
-        self.settings = Some(Settings::from(self));
+        self.overlay = Some(Overlay::Settings(Settings::from(self)));
+    }
+
+    fn open_save(&mut self) {
+        let dir = self
+            .files
+            .get(self.index)
+            .and_then(|p| p.parent())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().to_string_lossy().into_owned());
+        let stem = if self.sheet.is_some() {
+            "contactsheet".to_string()
+        } else {
+            self.files
+                .get(self.index)
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "peepin".to_string())
+        };
+        self.overlay = Some(Overlay::Save(SaveDialog {
+            dir,
+            name: stem,
+            format: Format::Png,
+            note: String::new(),
+        }));
+    }
+
+    fn toggle_sheet(&mut self, ctx: &egui::Context) {
+        if self.sheet.is_some() {
+            self.sheet = None;
+            return;
+        }
+        self.stop_video();
+        if let Some((image, count)) = build_sheet(&self.files) {
+            let texture = ctx.load_texture("sheet", image.clone(), egui::TextureOptions::LINEAR);
+            self.sheet = Some(Sheet { texture, image, count });
+        }
+    }
+
+    fn open_rename(&mut self) {
+        let count = self.files.len();
+        self.overlay = Some(Overlay::Rename(RenameDialog {
+            pattern: "{name}-{n}".to_string(),
+            start: 1,
+            note: if count == 0 {
+                "no images or videos in this folder".to_string()
+            } else {
+                format!("{count} file(s) in this folder")
+            },
+        }));
     }
 
     fn save_settings(&mut self, ctx: &egui::Context) {
-        let Some(settings) = self.settings.as_ref() else {
+        let Some(Overlay::Settings(settings)) = self.overlay.as_ref() else {
             return;
         };
         let text = format!(
-            "# peepin — written by the F1 panel\n\
+            "# peepin — written by the settings panel (F2)\n\
              background = {}\n\
              mouse.left = {}\n\
              mouse.right = {}\n\
@@ -369,154 +480,350 @@ impl Peepin {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match std::fs::write(&path, text) {
+        let note = match std::fs::write(&path, text) {
             Ok(()) => {
                 self.background = settings.background;
                 self.left_button = settings.left;
                 self.right_button = settings.right;
                 self.palette = Palette::load();
                 self.apply_palette(ctx);
-                if let Some(settings) = self.settings.as_mut() {
-                    settings.note = "saved".to_string();
-                }
+                "saved".to_string()
             }
-            Err(err) => {
-                if let Some(settings) = self.settings.as_mut() {
-                    settings.note = format!("could not write {}: {err}", path.display());
-                }
-            }
+            Err(err) => format!("could not write {}: {err}", path.display()),
+        };
+        if let Some(Overlay::Settings(settings)) = self.overlay.as_mut() {
+            settings.note = note;
         }
     }
 
-    fn settings_keys(&mut self, ctx: &egui::Context) {
-        let close = ctx.input(|i| {
-            i.key_pressed(egui::Key::Escape)
-                || i.key_pressed(egui::Key::F1)
-                || ((i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::S))
+    /// Keys that belong to a panel rather than to the picture.
+    fn overlay_keys(&mut self, ctx: &egui::Context) {
+        let (escape, f1, f2, f11, ctrl_s) = ctx.input(|i| {
+            let ctrl = i.modifiers.command || i.modifiers.ctrl;
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::F1),
+                i.key_pressed(egui::Key::F2),
+                i.key_pressed(egui::Key::F11),
+                ctrl && i.key_pressed(egui::Key::S),
+            )
         });
-        if close {
-            let save = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
-            if save {
-                self.save_settings(ctx);
+        if escape {
+            self.overlay = None;
+            return;
+        }
+        if f1 {
+            self.overlay = match self.overlay {
+                Some(Overlay::Help) => None,
+                _ => Some(Overlay::Help),
+            };
+            return;
+        }
+        if f2 {
+            self.overlay = match self.overlay {
+                Some(Overlay::Settings(_)) => None,
+                _ => Some(Overlay::Settings(Settings::from(self))),
+            };
+            return;
+        }
+        if f11 {
+            self.overlay = match self.overlay {
+                Some(Overlay::Rename(_)) => None,
+                _ => Some(Overlay::Rename(RenameDialog {
+                    pattern: "{name}-{n}".to_string(),
+                    start: 1,
+                    note: String::new(),
+                })),
+            };
+            return;
+        }
+        if ctrl_s {
+            match self.overlay {
+                Some(Overlay::Settings(_)) => self.save_settings(ctx),
+                Some(Overlay::Save(_)) => self.save_picture(ctx),
+                _ => {}
             }
-            self.settings = None;
         }
     }
 
-    fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        let Some(settings) = self.settings.as_mut() else {
+    /// Write the picture (or the contact sheet) where the save panel says.
+    fn save_picture(&mut self, ctx: &egui::Context) {
+        let Some(Overlay::Save(dialog)) = self.overlay.as_ref() else {
             return;
         };
+        let dir = PathBuf::from(dialog.dir.trim());
+        let name = dialog.name.trim().to_string();
+        let format = dialog.format;
+        if name.is_empty() {
+            self.set_save_note("give the file a name");
+            return;
+        }
+        let source = match self.sheet.as_ref() {
+            Some(sheet) => sheet.image.clone(),
+            None => match self.source.clone() {
+                Some(image) => image,
+                None => {
+                    self.set_save_note("nothing loaded to save");
+                    return;
+                }
+            },
+        };
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.set_save_note(&format!("could not create {}: {err}", dir.display()));
+            return;
+        }
+        let path = dir.join(format!("{name}.{}", format.ext()));
+        match write_image(&source, &path, format) {
+            Ok(()) => {
+                self.set_save_note(&format!("saved {}", path.display()));
+                ctx.request_repaint();
+            }
+            Err(err) => {
+                self.set_save_note(&err);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn set_save_note(&mut self, note: &str) {
+        if let Some(Overlay::Save(dialog)) = self.overlay.as_mut() {
+            dialog.note = note.to_string();
+        }
+    }
+
+    fn draw_overlay(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette;
         let screen = ui.max_rect();
-        let size = Vec2::new(screen.width().min(560.0), screen.height().min(320.0));
+        let size = Vec2::new(
+            screen.width().min(680.0),
+            screen.height().min(520.0),
+        );
         let rect = Rect::from_min_size(Pos2::new(screen.left() + 12.0, screen.top() + 12.0), size);
         let mut panel = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
-        panel.painter().rect_filled(rect, 2.0, palette.bg.gamma_multiply(0.96));
-        panel.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+        panel
+            .painter()
+            .rect_filled(rect, 2.0, palette.bg.gamma_multiply(0.96));
+        panel
+            .painter()
+            .rect_stroke(rect, 2.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
 
-        let mut save_clicked = false;
-        let mut close_clicked = false;
+        let mut close = false;
+        let mut save_now = false;
 
-        egui::Frame::new().inner_margin(8.0).show(&mut panel, |ui| {
-            ui.label(egui::RichText::new("settings").color(palette.accent));
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("background");
-                for (label, mode) in [
-                    ("clear", Background::Transparent),
-                    ("blur", Background::Blur),
-                    ("solid", Background::Solid),
-                ] {
-                    let picked = settings.background == mode;
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new(label).color(if picked {
-                                palette.bg
-                            } else {
-                                palette.fg
-                            }))
-                            .fill(if picked { palette.accent } else { Color32::TRANSPARENT }),
-                        )
-                        .clicked()
-                    {
-                        settings.background = mode;
-                    }
+        egui::Frame::new().inner_margin(8.0).show(&mut panel, |ui| match self.overlay.as_mut() {
+            Some(Overlay::Help) => {
+                ui.label(egui::RichText::new("keys").color(palette.accent));
+                ui.separator();
+                for (key, what) in KEYS {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [190.0, 16.0],
+                            egui::Label::new(
+                                egui::RichText::new(*key).color(palette.accent).monospace(),
+                            ),
+                        );
+                        ui.label(*what);
+                    });
                 }
-            });
-
-            for (label, slot) in [("mouse left", 0), ("mouse right", 1)] {
+                ui.separator();
+                ui.label(egui::RichText::new("F1 closes this  ·  F2 settings").color(palette.dim));
+            }
+            Some(Overlay::Settings(settings)) => {
+                ui.label(egui::RichText::new("settings").color(palette.accent));
+                ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(label);
-                    for (text, step) in [("prev", Step::Previous), ("next", Step::Next)] {
-                        let current = if slot == 0 { settings.left } else { settings.right };
-                        let picked = current == step;
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new(text).color(if picked {
-                                    palette.bg
-                                } else {
-                                    palette.fg
-                                }))
-                                .fill(if picked { palette.accent } else { Color32::TRANSPARENT }),
-                            )
-                            .clicked()
-                        {
-                            if slot == 0 {
-                                settings.left = step;
-                            } else {
-                                settings.right = step;
-                            }
+                    ui.label("background");
+                    for (label, mode) in [
+                        ("clear", Background::Transparent),
+                        ("blur", Background::Blur),
+                        ("solid", Background::Solid),
+                    ] {
+                        let picked = settings.background == mode;
+                        if button(ui, label, picked, palette) {
+                            settings.background = mode;
                         }
                     }
                 });
-            }
-
-            ui.separator();
-            for (label, value) in [
-                ("text", &mut settings.fg),
-                ("panel", &mut settings.bg),
-                ("dim", &mut settings.dim),
-                ("accent", &mut settings.accent),
-            ] {
+                for (label, slot) in [("mouse left", 0), ("mouse right", 1)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        for (text, step) in [("prev", Step::Previous), ("next", Step::Next)] {
+                            let current = if slot == 0 { settings.left } else { settings.right };
+                            if button(ui, text, current == step, palette) {
+                                if slot == 0 {
+                                    settings.left = step;
+                                } else {
+                                    settings.right = step;
+                                }
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                for (label, value) in [
+                    ("text", &mut settings.fg),
+                    ("panel", &mut settings.bg),
+                    ("dim", &mut settings.dim),
+                    ("accent", &mut settings.accent),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        ui.add(
+                            egui::TextEdit::singleline(value)
+                                .font(FontId::monospace(13.0))
+                                .desired_width(120.0),
+                        );
+                    });
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(label);
+                    if ui.button("save  (ctrl+s)").clicked() {
+                        save_now = true;
+                    }
+                    if ui.button("close  (esc)").clicked() {
+                        close = true;
+                    }
+                    if !settings.note.is_empty() {
+                        ui.label(egui::RichText::new(&settings.note).color(palette.dim));
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("colours as #rrggbb; the terminal's own are read at start")
+                        .color(palette.dim),
+                );
+            }
+            Some(Overlay::Save(dialog)) => {
+                ui.label(egui::RichText::new("save as").color(palette.accent));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("folder");
                     ui.add(
-                        egui::TextEdit::singleline(value)
+                        egui::TextEdit::singleline(&mut dialog.dir)
                             .font(FontId::monospace(13.0))
-                            .desired_width(120.0),
+                            .desired_width(f32::INFINITY),
                     );
                 });
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("save  (ctrl+s)").clicked() {
-                    save_clicked = true;
+                ui.horizontal(|ui| {
+                    ui.label("name  ");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut dialog.name)
+                            .font(FontId::monospace(13.0))
+                            .desired_width(220.0),
+                    );
+                    ui.label(egui::RichText::new(format!(".{}", dialog.format.ext())).color(palette.dim));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("format");
+                    for (label, format) in [
+                        ("png", Format::Png),
+                        ("jpg", Format::Jpeg),
+                        ("webp", Format::Webp),
+                        ("bmp", Format::Bmp),
+                        ("tiff", Format::Tiff),
+                    ] {
+                        if button(ui, label, dialog.format == format, palette) {
+                            dialog.format = format;
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("save  (ctrl+s)").clicked() {
+                        save_now = true;
+                    }
+                    if ui.button("close  (esc)").clicked() {
+                        close = true;
+                    }
+                });
+                if !dialog.note.is_empty() {
+                    ui.label(egui::RichText::new(&dialog.note).color(palette.dim));
                 }
-                if ui.button("close  (esc)").clicked() {
-                    close_clicked = true;
-                }
-                if !settings.note.is_empty() {
-                    ui.label(egui::RichText::new(&settings.note).color(palette.dim));
-                }
-            });
-            ui.label(
-                egui::RichText::new("colours as #rrggbb; the terminal's own are read at start")
+                ui.label(
+                    egui::RichText::new(if self.sheet.is_some() {
+                        "the contact sheet is what gets saved"
+                    } else {
+                        "the picture is saved at its own size, not as zoomed on screen"
+                    })
                     .color(palette.dim),
-            );
+                );
+            }
+            Some(Overlay::Rename(rename)) => {
+                ui.label(egui::RichText::new("batch rename").color(palette.accent));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("pattern");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut rename.pattern)
+                            .font(FontId::monospace(13.0))
+                            .desired_width(240.0),
+                    );
+                    ui.label("start");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut format!("{}", rename.start))
+                            .font(FontId::monospace(13.0))
+                            .desired_width(50.0),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("{name} = the old name, {n} = the number; only images are renamed")
+                        .color(palette.dim),
+                );
+                ui.separator();
+                let images: Vec<PathBuf> = self
+                    .files
+                    .iter()
+                    .filter(|p| is_image(p))
+                    .cloned()
+                    .collect();
+                let width = images.len().max(1).to_string().len();
+                for (i, path) in images.iter().take(12).enumerate() {
+                    let old = path.file_name().unwrap_or_default().to_string_lossy();
+                    let new = rename_name(&rename.pattern, rename.start + i, width, path);
+                    ui.label(
+                        egui::RichText::new(format!("{old}  →  {new}")).color(palette.fg),
+                    );
+                }
+                if images.len() > 12 {
+                    ui.label(egui::RichText::new(format!("… {} more", images.len() - 12)).color(palette.dim));
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("rename").clicked() {
+                        save_now = true;
+                    }
+                    if ui.button("close  (esc)").clicked() {
+                        close = true;
+                    }
+                });
+                if !rename.note.is_empty() {
+                    ui.label(egui::RichText::new(&rename.note).color(palette.dim));
+                }
+            }
+            None => {}
         });
 
-        if save_clicked {
-            self.save_settings(ui.ctx());
+        if save_now {
+            match self.overlay.as_ref() {
+                Some(Overlay::Settings(_)) => self.save_settings(ui.ctx()),
+                Some(Overlay::Save(_)) => self.save_picture(ui.ctx()),
+                Some(Overlay::Rename(rename)) => {
+                    let pattern = rename.pattern.clone();
+                    let start = rename.start;
+                    let result = rename_images(&self.files, &pattern, start);
+                    if let Some(Overlay::Rename(rename)) = self.overlay.as_mut() {
+                        rename.note = result;
+                    }
+                }
+                _ => {}
+            }
         }
-        if close_clicked {
-            self.settings = None;
+        if close {
+            self.overlay = None;
         }
     }
 
@@ -626,6 +933,7 @@ impl Peepin {
 
     fn load(&mut self, ctx: &egui::Context) {
         self.stop_video();
+        self.sheet = None;
         self.texture = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
@@ -647,6 +955,7 @@ impl Peepin {
 
         match load_image(&path) {
             Ok(image) => {
+                self.source = Some(image.clone());
                 let size = Vec2::new(image.width() as f32, image.height() as f32);
                 self.image_size = size;
                 self.blur = Some(ctx.load_texture(
@@ -1010,6 +1319,54 @@ impl Peepin {
         }
     }
 
+    fn draw_sheet(&self, ui: &mut egui::Ui) {
+        let Some(sheet) = &self.sheet else {
+            return;
+        };
+        let palette = self.palette;
+        let painter = ui.painter();
+        let area = ui.max_rect();
+        let area = Rect::from_min_max(area.min, Pos2::new(area.max.x, area.max.y - 22.0));
+        let size = Vec2::new(sheet.image.width() as f32, sheet.image.height() as f32);
+        let fit = (area.width() / size.x)
+            .min(area.height() / size.y)
+            .min(1.0);
+        let rect = Rect::from_center_size(area.center() + self.pan, size * fit * self.zoom);
+        painter.image(
+            sheet.texture.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        painter.rect_stroke(area, 0.0, Stroke::new(1.0, palette.dim), StrokeKind::Inside);
+    }
+
+    fn sheet_status(&self, ui: &mut egui::Ui) {
+        let palette = self.palette;
+        let Some(sheet) = &self.sheet else {
+            return;
+        };
+        let text = format!(
+            "contact sheet · {} image(s) · zoom {:.0}%   [←/→] next file  [↑/↓ wheel] zoom  [ctrl+s] save  [F3] close",
+            sheet.count,
+            self.zoom * 100.0
+        );
+        let painter = ui.painter();
+        let rect = ui.max_rect();
+        let bar = Rect::from_min_max(
+            Pos2::new(rect.left() + 6.0, rect.bottom() - 20.0),
+            Pos2::new(rect.right() - 6.0, rect.bottom() - 2.0),
+        );
+        painter.rect_filled(bar.expand2(Vec2::new(2.0, 1.0)), 2.0, palette.bg.gamma_multiply(0.7));
+        painter.text(
+            Pos2::new(bar.left(), bar.top()),
+            Align2::LEFT_TOP,
+            text,
+            FontId::monospace(12.0),
+            palette.fg,
+        );
+    }
+
     fn draw_image(&self, ui: &mut egui::Ui) {
         let Some(texture) = &self.texture else {
             return;
@@ -1051,6 +1408,218 @@ fn pane_row(ui: &mut egui::Ui, name: &str, selected: bool, palette: Palette) -> 
     .clicked()
 }
 
+/// The key list F1 shows.
+const KEYS: &[(&str, &str)] = &[
+    ("← →", "previous / next file"),
+    ("mouse left / right", "previous / next (see F2)"),
+    ("wheel, ↑ ↓", "zoom in / out"),
+    ("middle drag", "pan a zoomed picture"),
+    ("0", "fit to window again"),
+    ("ctrl + ← → ↑ ↓", "resize the window"),
+    ("b", "background: clear, blur, solid"),
+    ("ctrl+o", "open: folders left, files right"),
+    ("ctrl+s", "save as (format of your choice)"),
+    ("F1", "this list"),
+    ("F2", "settings"),
+    ("F3", "contact sheet of this folder"),
+    ("F11", "batch rename the images here"),
+    ("ctrl+q", "quit"),
+];
+
+/// A row of the panels: a button that reads like a terminal toggle.
+fn button(ui: &mut egui::Ui, label: &str, picked: bool, palette: Palette) -> bool {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(if picked { palette.bg } else { palette.fg })
+                .monospace(),
+        )
+        .fill(if picked { palette.accent } else { Color32::TRANSPARENT })
+        .frame(picked),
+    )
+    .clicked()
+}
+
+/// Write a picture in the chosen format. JPEG has no alpha, so it is composited
+/// on white first; the others keep it.
+fn write_image(image: &egui::ColorImage, path: &Path, format: Format) -> Result<(), String> {
+    let width = image.width() as u32;
+    let height = image.height() as u32;
+    let rgba: Vec<u8> = image.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b(), p.a()]).collect();
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut out = std::io::BufWriter::new(file);
+    match format {
+        Format::Png => {
+            let encoder = image::codecs::png::PngEncoder::new(&mut out);
+            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())
+        }
+        Format::Jpeg => {
+            let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+            for p in &image.pixels {
+                let a = p.a() as u32;
+                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+                rgb.extend_from_slice(&[blend(p.r()), blend(p.g()), blend(p.b())]);
+            }
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92);
+            encoder
+                .encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
+                .map_err(|e| e.to_string())
+        }
+        Format::Webp => {
+            let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
+            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())
+        }
+        Format::Bmp => {
+            let encoder = image::codecs::bmp::BmpEncoder::new(&mut out);
+            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())
+        }
+        Format::Tiff => {
+            let encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+            image::ImageEncoder::write_image(encoder, &rgba, width, height, image::ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// The new name for `path` under `pattern`: `{name}` the old stem, `{n}` the
+/// zero-padded number.
+fn rename_name(pattern: &str, number: usize, width: usize, path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let number = format!("{number:0width$}");
+    let base = pattern
+        .replace("{name}", &stem)
+        .replace("{n}", &number);
+    if ext.is_empty() {
+        base
+    } else {
+        format!("{base}.{ext}")
+    }
+}
+
+/// Rename every image in `files`, two-phase so renames never collide with each
+/// other, and report what happened.
+fn rename_images(files: &[PathBuf], pattern: &str, start: usize) -> String {
+    let images: Vec<PathBuf> = files.iter().filter(|p| is_image(p)).cloned().collect();
+    if images.is_empty() {
+        return "no images to rename".to_string();
+    }
+    let width = images.len().to_string().len();
+    let dir = images[0].parent().map(|p| p.to_path_buf()).unwrap_or_default();
+
+    let mut staged = Vec::new();
+    for (i, path) in images.iter().enumerate() {
+        let temp = dir.join(format!(".peepin-rename-{i}"));
+        if let Err(err) = std::fs::rename(path, &temp) {
+            // Put back whatever moved already, then report.
+            for (moved_from, moved_to) in staged.iter().rev() {
+                let _ = std::fs::rename(moved_to, moved_from);
+            }
+            return format!("stopped: {} ({err})", path.display());
+        }
+        staged.push((path.clone(), temp));
+    }
+
+    let mut done = 0;
+    for (i, (original, temp)) in staged.iter().enumerate() {
+        let target = dir.join(rename_name(pattern, start + i, width, original));
+        if target.exists() {
+            let _ = std::fs::rename(temp, original);
+            continue;
+        }
+        match std::fs::rename(temp, &target) {
+            Ok(()) => done += 1,
+            Err(_) => {
+                let _ = std::fs::rename(temp, original);
+            }
+        }
+    }
+    format!("{done} of {} renamed", staged.len())
+}
+
+/// A contact sheet: every image in the folder as a polaroid, on a white board.
+fn build_sheet(files: &[PathBuf]) -> Option<(egui::ColorImage, usize)> {
+    let images: Vec<&PathBuf> = files.iter().filter(|p| is_image(p)).collect();
+    if images.is_empty() {
+        return None;
+    }
+    let images: Vec<&PathBuf> = images.into_iter().take(96).collect();
+    let count = images.len();
+
+    // A polaroid: 264x198 picture area, 16 around it, 44 below.
+    const PICTURE_W: u32 = 264;
+    const PICTURE_H: u32 = 198;
+    const MARGIN: u32 = 16;
+    const BOTTOM: u32 = 44;
+    let cell_w = PICTURE_W + MARGIN * 2;
+    let cell_h = PICTURE_H + MARGIN + BOTTOM;
+
+    let cols = (count as f64).sqrt().ceil().max(1.0) as u32;
+    let cols = cols.min(6);
+    let rows = ((count as u32) + cols - 1) / cols;
+    let gap = 18;
+    let width = cols * cell_w + gap * (cols + 1);
+    let height = rows * cell_h + gap * (rows + 1);
+
+    let mut sheet = image::RgbaImage::from_pixel(width, height, image::Rgba([236, 233, 226, 255]));
+
+    for (i, path) in images.iter().enumerate() {
+        let Ok(picture) = load_image(path) else {
+            continue;
+        };
+        let rgba: Vec<u8> = picture
+            .pixels
+            .iter()
+            .flat_map(|p| [p.r(), p.g(), p.b(), p.a()])
+            .collect();
+        let Some(source) = image::RgbaImage::from_raw(picture.width() as u32, picture.height() as u32, rgba) else {
+            continue;
+        };
+        // Keep the picture's own proportions and centre it on the card: stretching
+        // it to the frame would not look like a print in a polaroid.
+        let scale = (PICTURE_W as f32 / source.width() as f32)
+            .min(PICTURE_H as f32 / source.height() as f32);
+        let thumb_w = ((source.width() as f32 * scale).round() as u32).max(1);
+        let thumb_h = ((source.height() as f32 * scale).round() as u32).max(1);
+        let thumb = image::imageops::resize(
+            &source,
+            thumb_w,
+            thumb_h,
+            image::imageops::FilterType::Triangle,
+        );
+
+        let col = (i as u32) % cols;
+        let row = (i as u32) / cols;
+        let x = gap + col * (cell_w + gap);
+        let y = gap + row * (cell_h + gap);
+
+        // The white polaroid, then the picture on it.
+        let card = image::RgbaImage::from_pixel(cell_w, cell_h, image::Rgba([252, 251, 248, 255]));
+        image::imageops::overlay(&mut sheet, &card, i64::from(x), i64::from(y));
+        image::imageops::overlay(
+            &mut sheet,
+            &thumb,
+            i64::from(x + MARGIN + (PICTURE_W - thumb_w) / 2),
+            i64::from(y + MARGIN + (PICTURE_H - thumb_h) / 2),
+        );
+    }
+
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [sheet.width() as usize, sheet.height() as usize],
+        sheet.as_raw(),
+    );
+    Some((color, count))
+}
+
 fn shorten(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -1088,18 +1657,36 @@ impl eframe::App for Peepin {
             return;
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
-            if self.settings.is_some() {
-                self.settings = None;
-            } else {
-                self.open_settings();
+        let (f1, f2, f3, f11, ctrl_s) = ctx.input(|i| {
+            let ctrl = i.modifiers.command || i.modifiers.ctrl;
+            (
+                i.key_pressed(egui::Key::F1),
+                i.key_pressed(egui::Key::F2),
+                i.key_pressed(egui::Key::F3),
+                i.key_pressed(egui::Key::F11),
+                ctrl && i.key_pressed(egui::Key::S),
+            )
+        });
+
+        if self.overlay.is_some() {
+            self.overlay_keys(ctx);
+        } else if f3 {
+            self.toggle_sheet(ctx);
+        } else if f11 {
+            self.open_rename();
+            if let Some(Overlay::Rename(_)) = self.overlay {
+                // opened above
             }
+        } else if f1 {
+            self.overlay = Some(Overlay::Help);
+        } else if f2 {
+            self.open_settings();
+        } else if ctrl_s {
+            self.open_save();
         }
-        if self.settings.is_some() {
-            self.settings_keys(ctx);
-        }
-        if self.settings.is_some() {
-            self.draw_settings(ui);
+
+        if self.overlay.is_some() {
+            self.draw_overlay(ui);
             ctx.request_repaint_after(std::time::Duration::from_millis(60));
             return;
         }
@@ -1211,8 +1798,13 @@ impl eframe::App for Peepin {
             return;
         }
         self.draw_background(ui);
-        self.draw_image(ui);
-        self.status_bar(ui);
+        if self.sheet.is_some() {
+            self.draw_sheet(ui);
+            self.sheet_status(ui);
+        } else {
+            self.draw_image(ui);
+            self.status_bar(ui);
+        }
         ctx.request_repaint_after(std::time::Duration::from_millis(60));
     }
 }
@@ -1318,13 +1910,88 @@ fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
     Ok(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }
 
+/// Exercise the code that needs no window: every save format, and the sheet.
+fn selftest() {
+    let arg = std::env::args().skip(1).find(|a| !a.starts_with("--"));
+    let Some(path) = arg.map(PathBuf::from) else {
+        println!("usage: peepin --selftest <file>");
+        return;
+    };
+    match load_image(&path) {
+        Ok(image) => {
+            println!("loaded {} ({}x{})", path.display(), image.width(), image.height());
+            for format in [Format::Png, Format::Jpeg, Format::Webp, Format::Bmp, Format::Tiff] {
+                let out = std::path::PathBuf::from(format!("/tmp/opencode/peepin-test.{}", format.ext()));
+                match write_image(&image, &out, format) {
+                    Ok(()) => {
+                        let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                        println!("  {} -> {} ({size} bytes)", format.ext(), out.display());
+                    }
+                    Err(err) => println!("  {} failed: {err}", format.ext()),
+                }
+            }
+        }
+        Err(err) => println!("load failed: {err}"),
+    }
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let files = media_in(&dir);
+    match build_sheet(&files) {
+        Some((sheet, count)) => {
+            let out = std::path::PathBuf::from("/tmp/opencode/peepin-sheet.png");
+            match write_image(&sheet, &out, Format::Png) {
+                Ok(()) => println!(
+                    "  sheet of {count} image(s) -> {} ({}x{})",
+                    out.display(),
+                    sheet.width(),
+                    sheet.height()
+                ),
+                Err(err) => println!("  sheet save failed: {err}"),
+            }
+        }
+        None => println!("  no sheet (no images in {})", dir.display()),
+    }
+
+    // Rename, in a throwaway copy so the real folder is untouched.
+    let scratch = std::path::PathBuf::from("/tmp/opencode/peepin-rename");
+    let _ = std::fs::remove_dir_all(&scratch);
+    if std::fs::create_dir_all(&scratch).is_ok() {
+        let mut copies = Vec::new();
+        for (i, file) in files.iter().take(4).enumerate() {
+            let target = scratch.join(format!("copy-{i}.png"));
+            if std::fs::copy(file, &target).is_ok() {
+                copies.push(target);
+            }
+        }
+        if !copies.is_empty() {
+            let result = rename_images(&copies, "photo-{n}", 1);
+            let mut names: Vec<String> = std::fs::read_dir(&scratch)
+                .map(|read| {
+                    read.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            println!("  rename: {result} -> {names:?}");
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--selftest") {
+        selftest();
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--palette") {
         Peepin::palette_for_debug();
         return Ok(());
     }
     let picker_at_start = std::env::args().any(|a| a == "--picker");
     let settings_at_start = std::env::args().any(|a| a == "--settings");
+    let sheet_at_start = std::env::args().any(|a| a == "--sheet");
+    let help_at_start = std::env::args().any(|a| a == "--help-overlay");
+    let save_at_start = std::env::args().any(|a| a == "--save-overlay");
+    let rename_at_start = std::env::args().any(|a| a == "--rename-overlay");
     let arg = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with("--"))
@@ -1347,12 +2014,23 @@ fn main() -> eframe::Result<()> {
         "peepin",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(Peepin::new(
+            let mut app = Peepin::new(
                 cc,
                 arg.clone(),
                 picker_at_start,
                 settings_at_start,
-            )))
+                sheet_at_start,
+            );
+            if help_at_start {
+                app.overlay = Some(Overlay::Help);
+            }
+            if save_at_start {
+                app.open_save();
+            }
+            if rename_at_start {
+                app.open_rename();
+            }
+            Ok(Box::new(app))
         }),
     )
 }

@@ -30,7 +30,11 @@ peepin ~/Pictures            # opens the first image in the folder
 | `0` | fit to window again |
 | `Ctrl`+`←` `→` `↑` `↓` | resize the window itself (works while floating) |
 | `Ctrl+O` | file picker |
-| `F1` | settings panel (background, mouse buttons, colours) |
+| `Ctrl+S` | save as: folder, name and format (png, jpg, webp, bmp, tiff) |
+| `F1` | the key list |
+| `F2` | settings panel (background, mouse buttons, colours) |
+| `F3` | contact sheet of the folder, as polaroids |
+| `F11` | batch rename the images in the folder |
 | `b` | background: clear → blur → solid |
 | `Ctrl+Q` | quit |
 
@@ -86,11 +90,30 @@ color.accent = #7fb3ad   # selection
 
 `peepin --palette` prints what it resolved.
 
-## Settings (F1)
+## Settings (F2)
 
-The F1 panel edits the same file: background mode, which way each mouse button
+The F2 panel edits the same file: background mode, which way each mouse button
 walks, and the four colours. `Ctrl+S` (or *save*) writes `peepin.conf` and applies
-it at once; `Esc` closes, `F1` toggles.
+it at once; `Esc` closes, `F2` toggles.
+
+## Saving (Ctrl+S)
+
+Writes the picture at its own size — not as zoomed on screen — to the folder and
+name in the panel, in png, jpg (quality 92, alpha composited on white), webp
+(lossless), bmp or tiff. With a contact sheet open, Ctrl+S saves the sheet.
+
+## Contact sheet (F3)
+
+Every image in the folder as a polaroid: a white card, the picture kept in its own
+proportions and centred, with the classic deeper bottom edge, laid out on a cream
+board (at most 96 images). Ctrl+S saves it; F3 or a new file closes it.
+
+## Batch rename (F11)
+
+`{name}` is the old stem, `{n}` the number (zero-padded to the folder's count), and
+`start` is where numbering begins; the extension is kept. The panel previews the
+first twelve names, and *rename* renames the images in two passes, so a batch can
+never collide with itself.
 
 ## Picker (Ctrl+O)
 
