@@ -933,8 +933,6 @@ struct Peepin {
     /// A line shown instead of the file name for a moment, e.g. which track was
     /// just picked.
     video_note: Option<(String, Instant)>,
-    /// A line shown in the status bar for a moment, e.g. where a screenshot went.
-    note: Option<(String, Instant)>,
     /// A video waiting for the window to be mapped.
     pending_video: Option<PathBuf>,
     palette: Palette,
@@ -1054,7 +1052,6 @@ impl Peepin {
             sub_menu_at_start: false,
             sub_menu: false,
             video_note: None,
-            note: None,
             pending_video: None,
             palette,
             background: Background::Transparent,
@@ -1850,75 +1847,6 @@ impl Peepin {
             }
             None => self.status = "no subtitle file in this folder".to_string(),
         }
-    }
-
-    /// Save the window as a PNG. `target` names the file; without one the name
-    /// is `peepin-<date>-<time>.png` in the folder of the file on screen.
-    fn screenshot(&mut self, target: Option<PathBuf>) -> Option<PathBuf> {
-        let Some(window) = self.window_id else {
-            self.say("screenshot: no X11 window to take it from");
-            return None;
-        };
-        let Some(pixels) = capture_window(window) else {
-            self.say("screenshot: the window could not be read");
-            return None;
-        };
-        let path = match target {
-            Some(path) => path,
-            None => {
-                let folder = self.screenshot_folder();
-                let _ = std::fs::create_dir_all(&folder);
-                free_name(&folder, &format!("peepin-{}.png", stamp()))
-            }
-        };
-        let mut png: Vec<u8> = Vec::new();
-        if let Err(err) = image::DynamicImage::ImageRgba8(pixels).write_to(
-            &mut std::io::Cursor::new(&mut png),
-            image::ImageFormat::Png,
-        ) {
-            self.say(format!("shot: {err}"));
-            return None;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match std::fs::write(&path, &png) {
-            Ok(()) => {
-                // On the clipboard as well, so it can be pasted at once.
-                let copied = copy_to_clipboard(&png);
-                self.say(format!(
-                    "shot → {name}{}",
-                    if copied { " · clipboard" } else { "" }
-                ));
-                Some(path)
-            }
-            Err(err) => {
-                self.say(format!("shot: {err}"));
-                None
-            }
-        }
-    }
-
-    /// Where a screenshot goes: the folder set in F2 (`screenshot.dir`), or the
-    /// folder of the picture on screen.
-    fn screenshot_folder(&self) -> PathBuf {
-        if !self.shot_dir.trim().is_empty() {
-            return expand_home(&self.shot_dir);
-        }
-        self.files
-            .get(self.index)
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
-    }
-
-    /// A line in the status bar, and in the video bar, for a few seconds.
-    fn say(&mut self, note: impl Into<String>) {
-        let note = note.into();
-        self.video_note = Some((note.clone(), Instant::now()));
-        self.note = Some((note, Instant::now()));
     }
 
     /// Keep the child window over the video area, follow a resize, and ask mpv
@@ -2767,22 +2695,14 @@ impl Peepin {
         // room the hints would have had, and keeps its own tail in sight.
         let tails = [
             format!(
-                "   {count}   {zoom}   [←/→] next  [↑/↓ wheel] zoom  [b] {background}  [p] shot  [ctrl+o] open  [ctrl+q] quit"
+                "   {count}   {zoom}   [←/→] next  [↑/↓ wheel] zoom  [b] {background}  [ctrl+o] open  [ctrl+q] quit"
             ),
-            format!("   {count}   {zoom}   [b] {background}  [p] shot"),
+            format!("   {count}   {zoom}   [b] {background}"),
             format!("   {count}   {zoom}"),
             format!("   {count}"),
             String::new(),
         ];
         let room = bar.width() - 4.0;
-        let fresh = self
-            .note
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(4));
-        let tails = match fresh {
-            Some((note, _)) => vec![format!("   {count}   {note}")],
-            None => tails.to_vec(),
-        };
         let mut text = String::new();
         for tail in tails {
             let used = painter
@@ -2922,7 +2842,7 @@ impl Peepin {
         let text = fit_text(
             painter,
             &format!(
-                "contact sheet · {} image(s) · zoom {:.0}%   [←/→] next file  [↑/↓ wheel] zoom  [ctrl+s] save  [p] shot  [F3] close",
+                "contact sheet · {} image(s) · zoom {:.0}%   [←/→] next file  [↑/↓ wheel] zoom  [ctrl+s] save  [F3] close",
                 sheet.count,
                 self.zoom * 100.0
             ),
@@ -2994,7 +2914,6 @@ const KEYS: &[(&str, &str)] = &[
     ("0", "fit to window again"),
     ("ctrl + ← → ↑ ↓", "resize the window"),
     ("b", "background: clear, blur, solid"),
-    ("p", "screenshot of the window"),
     ("r", "read the file again"),
     ("space (video)", "pause"),
     ("↑ ↓ (video)", "volume"),
@@ -3717,12 +3636,6 @@ impl eframe::App for Peepin {
         // on disk while it is open.
         if ctx.input(|i| i.key_pressed(egui::Key::R)) && self.overlay.is_none() {
             self.load(ctx);
-        }
-        let plain_p = ctx.input(|i| {
-            !(i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::P)
-        });
-        if plain_p {
-            self.screenshot(None);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::B)) {
             self.background = match self.background {

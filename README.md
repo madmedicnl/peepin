@@ -26,8 +26,8 @@ fitted into whatever space the window has.
 - **Contact sheet** `F3`: the whole folder as polaroids; `Ctrl+S` saves it.
 - **Batch rename** `F11`: `name-{n}`, with the first number typed in.
 - **Save as** `Ctrl+S`: png, jpg, webp, bmp or tiff.
-- **Screenshot** `p`, or `peepin --screenshot [FILE]` from a shell: the window
-  as it looks — picture, background, bars, video included — written as a PNG.
+- **Screenshot** from the shell: `peepin --screenshot [FILE]` writes the screen
+  (video included) as a PNG and puts it on the clipboard.
 - **Your colours**: it reads kitty's config, and `F2` edits the rest.
 
 ## What it needs
@@ -117,27 +117,8 @@ peepin --info ~/Pictures | sort -k3 -h        # the biggest pictures last
 peepin --list ~/Pictures/2026 | cut -d: -f2   # just the names
 ```
 
-### Screenshot from the command line
-
-Like `scrot`, peepin can take the picture and leave:
-
-```sh
-peepin --screenshot                  # peepin-20261120-143512.png here
-peepin --screenshot out.png          # or wherever you say
-peepin --screenshot -u out.png       # the window that has the focus
-peepin --screenshot -d 3 out.png     # three seconds from now
-```
-
-The path it wrote is printed, so `p=$(peepin --screenshot)` works in a script. A
-name that exists is not overwritten: `-2`, `-3` and on are added. Without a FILE
-it goes to the folder set with F2 (`screenshot.dir`), or to the current
-directory, and the PNG is put on the clipboard like `p` does.
-
-Under Wayland the screen is taken with **grim** when it is installed, because a
-compositor's own picture is the only one that shows every window. Without it —
-and always for `-u`, which reads an X11 window — peepin uses `XGetImage` itself,
-which cannot see windows that are not X11's. The path of the file is on stdout;
-anything wrong is on stderr with a non-zero exit status.
+`peepin --screenshot [FILE]` takes the screen and leaves, like `scrot` — the
+section [Screenshot](#screenshot-command-line) below has the flags.
 
 ## Keys
 
@@ -156,7 +137,6 @@ anything wrong is on stderr with a non-zero exit status.
 | `F3` | contact sheet of the folder, as polaroids |
 | `F11` | batch rename the images in the folder |
 | `b` | background: clear → blur → solid |
-| `p` | screenshot of the window, saved beside the file |
 | `r` | read the file again from disk |
 | `space` (video) | pause / play |
 | `↑` `↓` (video) | volume |
@@ -264,7 +244,7 @@ walks, where screenshots go, and the four colours. `Ctrl+S` (or *save*) writes
 `peepin.conf` and applies it at once; `Esc` closes, `F2` toggles.
 
 ```ini
-# where `p` and `peepin --screenshot` write; empty means beside the picture
+# where `peepin --screenshot` writes; empty means beside the picture
 screenshot.dir = ~/Pictures/Screenshots
 ```
 
@@ -274,27 +254,27 @@ Writes the picture at its own size — not as zoomed on screen — to the folder
 name in the panel, in png, jpg (quality 92, alpha composited on white), webp
 (lossless), bmp or tiff. With a contact sheet open, Ctrl+S saves the sheet.
 
-## Screenshot (p)
+## Screenshot (command line)
 
-`p` writes the window as it is on screen to `peepin-<date>-<time>.png`
-(`peepin-20261120-143512.png`), with a `-2`, `-3` when one already has that name.
-The folder is the one set in F2 (`screenshot.dir`); left empty, the picture goes
-beside the file you are looking at.
+`peepin --screenshot [FILE]` takes the picture and leaves, like `scrot`: no
+window opens, the PNG is written, the path is printed, and the picture goes on
+the clipboard as well. The folder is the one set in F2 (`screenshot.dir`); left
+empty, the file lands in the current directory. A name that exists is not
+overwritten — `-2`, `-3` and on are added.
 
-It goes **on the clipboard** as well, so `Ctrl+V` in a chat or an editor pastes
-it straight away — `wl-copy` on Wayland, `xclip` on X11. The status bar says
-`shot → peepin-….png · clipboard` when both worked.
+```sh
+peepin --screenshot                  # peepin-20261120-143512.png here
+peepin --screenshot out.png          # or wherever you say
+peepin --screenshot -u out.png       # the window that has the focus
+peepin --screenshot -d 3 out.png     # three seconds from now
+```
 
-The picture, the background, the status bar — and a video, because the window is
-read from the X server with its children — are all in it, which makes it a good
-way to show what you see.
-
-That last part is also why it needs the X11 window peepin already opens for mpv:
-under a compositor without XWayland there is nothing to read and the bar says so.
-The PNG keeps the window's transparency, so a "clear" background stays clear.
-
-The same picture from a shell, without opening the viewer, is
-`peepin --screenshot [FILE]` — see [Command line](#command-line).
+It is the whole screen, so it holds every window, the video in it included —
+**grim** does that under Wayland when it is installed, since only the compositor
+can see every window. Without grim, and always for `-u`, peepin reads the X11
+window itself with `XGetImage`, which cannot see windows that are not X11's. The
+clipboard is `wl-copy` on Wayland (it keeps serving the picture after peepin has
+exited) and `xclip` on X11.
 
 ## Contact sheet (F3)
 
