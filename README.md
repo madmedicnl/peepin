@@ -139,7 +139,8 @@ works. Ctrl+S saves it; F3 or a new file closes it.
 `{name}` is the old stem, `{n}` the number (zero-padded to the folder's count), and
 `start` is a field you type the first number into; the extension is kept. The panel previews the
 first twelve names, and *rename* renames the images in two passes, so a batch can
-never collide with itself.
+never collide with itself. The folder is re-read afterwards and the picture you
+were looking at stays selected, so the arrows keep working.
 
 ## Picker (Ctrl+O)
 
@@ -155,4 +156,10 @@ does not appear under eframe's ui-based entry point).
 | `Enter`, `→` on a folder | open the folder or file under the cursor |
 | `←` | one folder up |
 | `Backspace` | one folder up |
+| `v` | thumbnails beside the names, or names only |
 | `Esc` | close |
+
+With `v` on, the right column shows a 96 × 72 thumbnail for every row, cover-cropped
+and cached per path. Only the rows on screen are decoded, and only a couple per
+frame, so a folder of three hundred large DDS files fills in as you look at it
+instead of freezing the window; a video, which has no still frame, shows `▶`.

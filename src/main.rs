@@ -195,6 +195,13 @@ struct Pick {
     /// False = files have the focus, true = folders.
     on_folders: bool,
     error: String,
+    /// `v` in the picker: show a thumbnail beside every name in the right column.
+    preview: bool,
+    /// Thumbnails already made, so scrolling does not decode the same picture twice.
+    thumbs: std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// Set when the arrows moved the selection, so the list can bring it back on
+    /// screen in the next frame.
+    scroll: bool,
 }
 
 /// The F1 panel: the handful of settings that are worth changing without an
@@ -289,6 +296,8 @@ struct Peepin {
     video: Option<Child>,
     status: String,
     picker: Option<Pick>,
+    /// Whether the picker shows thumbnails; remembered for the next time it opens.
+    previews: bool,
     left_button: Step,
     right_button: Step,
     drag: Option<(Pos2, Vec2)>,
@@ -337,6 +346,7 @@ impl Peepin {
         open_picker_now: bool,
         open_settings_now: bool,
         open_sheet_now: bool,
+        previews_at_start: bool,
     ) -> Self {
         let palette = Palette::load();
 
@@ -366,6 +376,7 @@ impl Peepin {
             video: None,
             status: String::new(),
             picker: None,
+            previews: previews_at_start,
             left_button: Step::Previous,
             right_button: Step::Next,
             drag: None,
@@ -385,6 +396,7 @@ impl Peepin {
         app.load(&cc.egui_ctx);
         if open_picker_now {
             app.open_picker();
+            app.previews = previews_at_start;
         }
         if open_settings_now {
             app.open_settings();
@@ -1070,6 +1082,9 @@ impl Peepin {
             files: Pane { entries: Vec::new(), selected: 0 },
             on_folders: true,
             error: String::new(),
+            preview: self.previews,
+            thumbs: std::collections::HashMap::new(),
+            scroll: false,
         });
         self.refresh_picker();
     }
@@ -1176,7 +1191,12 @@ impl Peepin {
         if tab {
             pick.on_folders = !pick.on_folders;
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::V)) {
+            pick.preview = !pick.preview;
+            self.previews = pick.preview;
+        }
         if up || down {
+            pick.scroll = true;
             let pane = if pick.on_folders { &mut pick.folders } else { &mut pick.files };
             if !pane.entries.is_empty() {
                 pane.selected = if up {
@@ -1212,12 +1232,13 @@ impl Peepin {
     }
 
     fn draw_picker(&mut self, ui: &mut egui::Ui) {
-        let Some(pick) = self.picker.as_ref() else {
+        if self.picker.is_none() {
             return;
-        };
+        }
         let palette = self.palette;
         let mut folder_click: Option<PathBuf> = None;
         let mut file_click: Option<PathBuf> = None;
+        let pick = self.picker.as_mut().unwrap();
 
         // Drawn straight into our own layer: an `egui::Window` does not show up
         // under eframe's ui-based app entry point.
@@ -1264,27 +1285,130 @@ impl Peepin {
                         Vec2::new(ui.available_width(), height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            ui.label(egui::RichText::new("files").color(palette.dim));
-                            egui::ScrollArea::vertical()
-                                .id_salt("files")
-                                .auto_shrink([false, false])
-                                .show(ui, |ui| {
-                                    for (i, (name, path)) in pick.files.entries.iter().enumerate() {
-                                        let picked = !pick.on_folders && i == pick.files.selected;
-                                        if pane_row(ui, name, picked, palette) {
-                                            file_click = Some(path.clone());
+                            let header = if pick.preview {
+                                "files   (v: names only)"
+                            } else {
+                                "files   (v: previews)"
+                            };
+                            ui.label(egui::RichText::new(header).color(palette.dim));
+                            let files = pick.files.entries.clone();
+                            if pick.preview {
+                                // One row is a thumbnail and its name; only the rows
+                                // on screen are decoded, so a big folder stays quick.
+                                let row = 76.0;
+                                let mut budget = 2;
+                                egui::ScrollArea::vertical()
+                                    .id_salt("files-preview")
+                                    .auto_shrink([false, false])
+                                    .show_rows(ui, row, files.len(), |ui, range| {
+                                        for i in range {
+                                            let (name, path) = files[i].clone();
+                                            let picked =
+                                                !pick.on_folders && i == pick.files.selected;
+                                            let mut hit = false;
+                                            let row_rect = ui
+                                                .horizontal(|ui| {
+                                                let mut later = false;
+                                                let thumb = thumb_for(
+                                                    ui.ctx(),
+                                                    &mut pick.thumbs,
+                                                    &path,
+                                                    &mut budget,
+                                                    &mut later,
+                                                );
+                                                if later {
+                                                    ui.ctx().request_repaint();
+                                                }
+                                                let (rect, response) = ui.allocate_exact_size(
+                                                    Vec2::new(96.0, 72.0),
+                                                    egui::Sense::click(),
+                                                );
+                                                match thumb {
+                                                    Some(tex) => {
+                                                        ui.painter().image(
+                                                            tex.id(),
+                                                            rect,
+                                                            Rect::from_min_max(
+                                                                Pos2::ZERO,
+                                                                Pos2::new(1.0, 1.0),
+                                                            ),
+                                                            Color32::WHITE,
+                                                        );
+                                                    }
+                                                    None => {
+                                                        ui.painter().rect_stroke(
+                                                            rect,
+                                                            1.0,
+                                                            Stroke::new(1.0, palette.dim),
+                                                            StrokeKind::Inside,
+                                                        );
+                                                        ui.painter().text(
+                                                            rect.center(),
+                                                            Align2::CENTER_CENTER,
+                                                            if is_video(&path) { "▶" } else { "?" },
+                                                            FontId::monospace(14.0),
+                                                            palette.dim,
+                                                        );
+                                                    }
+                                                }
+                                                hit |= response.clicked();
+                                                if pane_row(ui, &name, picked, palette) {
+                                                    hit = true;
+                                                }
+                                            })
+                                                .response
+                                                .rect;
+                                            if picked && pick.scroll {
+                                                ui.scroll_to_rect(
+                                                    row_rect,
+                                                    Some(egui::Align::Center),
+                                                );
+                                                pick.scroll = false;
+                                            }
+                                            if hit {
+                                                file_click = Some(path);
+                                            }
                                         }
-                                    }
-                                    if pick.files.entries.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new("no images or videos here")
-                                                .color(palette.dim),
-                                        );
-                                    }
-                                });
+                                    });
+                                if files.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("no images or videos here")
+                                            .color(palette.dim),
+                                    );
+                                }
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("files")
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        for (i, (name, path)) in files.iter().enumerate() {
+                                            let picked = !pick.on_folders && i == pick.files.selected;
+                                            if picked && pick.scroll {
+                                                ui.scroll_to_rect(
+                                                    Rect::from_min_size(
+                                                        ui.cursor().min,
+                                                        Vec2::new(ui.available_width(), 18.0),
+                                                    ),
+                                                    Some(egui::Align::Center),
+                                                );
+                                                pick.scroll = false;
+                                            }
+                                            if pane_row(ui, name, picked, palette) {
+                                                file_click = Some(path.clone());
+                                            }
+                                        }
+                                        if files.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("no images or videos here")
+                                                    .color(palette.dim),
+                                            );
+                                        }
+                                    });
+                            }
                         },
                     );
                 });
+                pick.scroll = false;
 
                 if !pick.error.is_empty() {
                     ui.label(egui::RichText::new(&pick.error).color(Color32::LIGHT_RED));
@@ -1529,6 +1653,7 @@ const KEYS: &[(&str, &str)] = &[
     ("ctrl + ← → ↑ ↓", "resize the window"),
     ("b", "background: clear, blur, solid"),
     ("ctrl+o", "open: folders left, files right"),
+    ("v in the picker", "thumbnails beside the names"),
     ("ctrl+s", "save as (format of your choice)"),
     ("F1", "this list"),
     ("F2", "settings"),
@@ -1536,6 +1661,60 @@ const KEYS: &[(&str, &str)] = &[
     ("F11", "batch rename the images here"),
     ("ctrl+q", "quit"),
 ];
+
+/// A thumbnail for the picker's right column, cached per path so scrolling does
+/// not decode the same picture twice.
+fn thumb_for(
+    ctx: &egui::Context,
+    cache: &mut std::collections::HashMap<PathBuf, Option<egui::TextureHandle>>,
+    path: &Path,
+    budget: &mut u32,
+    later: &mut bool,
+) -> Option<egui::TextureHandle> {
+    if let Some(entry) = cache.get(path) {
+        return entry.clone();
+    }
+    // Decoding a big DDS takes a moment, so only a couple are made per frame and
+    // the rest arrive over the next few frames instead of the list standing still.
+    if *budget == 0 {
+        *later = true;
+        return None;
+    }
+    *budget -= 1;
+    let made = load_image(path).ok().map(|image| {
+        let small = thumbnail(&image, 96, 72);
+        ctx.load_texture(
+            format!("thumb-{}", path.to_string_lossy()),
+            small,
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), made.clone());
+    made
+}
+
+/// `image` scaled to fill a w x h box and centre-cropped, for a picker thumbnail.
+fn thumbnail(image: &egui::ColorImage, w: u32, h: u32) -> egui::ColorImage {
+    let rgba: Vec<u8> = image
+        .pixels
+        .iter()
+        .flat_map(|p| [p.r(), p.g(), p.b(), p.a()])
+        .collect();
+    let Some(src) = image::RgbaImage::from_raw(image.width() as u32, image.height() as u32, rgba)
+    else {
+        return image.clone();
+    };
+    let scale = (w as f32 / src.width() as f32).max(h as f32 / src.height() as f32);
+    let sw = ((src.width() as f32 * scale).ceil() as u32).max(w);
+    let sh = ((src.height() as f32 * scale).ceil() as u32).max(h);
+    let scaled = image::imageops::resize(&src, sw, sh, image::imageops::FilterType::Triangle);
+    let cropped =
+        image::imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
+    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw())
+}
 
 /// A row of the panels: a button that reads like a terminal toggle.
 fn button(ui: &mut egui::Ui, label: &str, picked: bool, palette: Palette) -> bool {
@@ -2361,6 +2540,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let picker_at_start = std::env::args().any(|a| a == "--picker");
+    let previews_at_start = std::env::args().any(|a| a == "--previews");
     let settings_at_start = std::env::args().any(|a| a == "--settings");
     let sheet_at_start = std::env::args().any(|a| a == "--sheet");
     let help_at_start = std::env::args().any(|a| a == "--help-overlay");
@@ -2394,6 +2574,7 @@ fn main() -> eframe::Result<()> {
                 picker_at_start,
                 settings_at_start,
                 sheet_at_start,
+                previews_at_start,
             );
             if help_at_start {
                 app.overlay = Some(Overlay::Help);
