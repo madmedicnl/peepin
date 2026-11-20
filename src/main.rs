@@ -746,6 +746,9 @@ impl Peepin {
             sheet: None,
             sheet_job: None,
         };
+        if let (Some(window), Some(icon)) = (app.window_id, window_icon()) {
+            set_window_icon(window, &icon);
+        }
         app.read_config();
         app.load(&cc.egui_ctx);
         if open_picker_now {
@@ -3236,6 +3239,67 @@ impl Drop for Peepin {
 }
 
 /// The X11 window id of our own window, when winit created it through XWayland.
+/// The icon for the task bar and the window list. The picture is compiled into
+/// the binary, so an installed peepin still carries it.
+fn window_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../assets/peep.png");
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    // 128 square: one `XChangeProperty` can carry at most 262140 bytes, and a
+    // 256 square icon is 262144.
+    let size = 128u32;
+    let small = image::imageops::resize(
+        &image,
+        size,
+        size,
+        image::imageops::FilterType::Lanczos3,
+    );
+    Some(egui::IconData {
+        rgba: small.into_raw(),
+        width: size,
+        height: size,
+    })
+}
+
+/// Put the icon on our own X11 window. winit offers it through
+/// `ViewportBuilder::with_icon`, but the property comes out empty under
+/// XWayland, so it is set here as well — the same `_NET_WM_ICON` the task bar
+/// and the window list read.
+fn set_window_icon(window: u64, icon: &egui::IconData) {
+    let Ok(xlib) = x11_dl::xlib::Xlib::open() else {
+        return;
+    };
+    unsafe {
+        let display = (xlib.XOpenDisplay)(std::ptr::null());
+        if display.is_null() {
+            return;
+        }
+        let atom = (xlib.XInternAtom)(display, c"_NET_WM_ICON".as_ptr(), 0);
+        let mut data: Vec<u64> = Vec::with_capacity(2 + icon.rgba.len() / 4);
+        data.push(icon.width as u64);
+        data.push(icon.height as u64);
+        for pixel in icon.rgba.chunks_exact(4) {
+            data.push(
+                (pixel[3] as u64) << 24
+                    | (pixel[0] as u64) << 16
+                    | (pixel[1] as u64) << 8
+                    | pixel[2] as u64,
+            );
+        }
+        (xlib.XChangeProperty)(
+            display,
+            window as x11_dl::xlib::Window,
+            atom,
+            x11_dl::xlib::XA_CARDINAL,
+            32,
+            x11_dl::xlib::PropModeReplace,
+            data.as_ptr() as *const u8,
+            data.len() as i32,
+        );
+        (xlib.XFlush)(display);
+        (xlib.XCloseDisplay)(display);
+    }
+}
+
 fn x11_window_id(cc: &eframe::CreationContext<'_>) -> Option<u64> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = cc.window_handle().ok()?;
@@ -3505,12 +3569,16 @@ fn main() -> eframe::Result<()> {
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("peepin")
+        .with_inner_size([960.0, 640.0])
+        .with_transparent(true)
+        .with_min_inner_size([240.0, 160.0]);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let mut options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("peepin")
-            .with_inner_size([960.0, 640.0])
-            .with_transparent(true)
-            .with_min_inner_size([240.0, 160.0]),
+        viewport,
         ..Default::default()
     };
     // XWayland, so the window has an X11 id: that is what mpv needs to draw its

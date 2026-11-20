@@ -1,22 +1,82 @@
+<p align="center"><img src="assets/peep.png" width="130" alt="peepin"></p>
+
 # peepin
 
-A tiny image and video viewer with a terminal feel: no window background of its
-own, monospace green text, and the picture scaled into whatever space the window
-has. Built for flipping through Fallout's `.dds` textures as much as for photos.
+A small image and video viewer for Linux with a terminal feel: a window with no
+background of its own, monospace text in your terminal's colours, and the picture
+fitted into whatever space the window has.
+
+![peepin showing a picture](docs/peepin.jpg)
+
+## What it does
+
+- **Walks a folder.** `←` and `→` — or the mouse's side buttons — go from file
+  to file, pictures and videos in one list.
+- **Fits the picture** into the window, zooms with the wheel or `↑` `↓`, pans a
+  zoomed picture by dragging, `0` fits it again.
+- **Three backgrounds**: the desktop showing through, a blurred copy of the
+  picture, or the terminal's background colour. `b` cycles them.
+- **Video through mpv**, drawn *inside* peepin's window, with a bar under it:
+  seek, clock, pause, mute, volume, and the subtitle track — including the ones
+  baked into an MKV, listed with their language.
+- **Reads the awkward formats**: `.dds` (Fallout's textures, BC1–BC7) by itself,
+  and heic, jxl, psd, svg and camera raw through ImageMagick or the format's own
+  tool.
+- **Picker** `Ctrl+O`: folders on the left, files on the right, thumbnails on `v`.
+- **Contact sheet** `F3`: the whole folder as polaroids; `Ctrl+S` saves it.
+- **Batch rename** `F11`: `name-{n}`, with the first number typed in.
+- **Save as** `Ctrl+S`: png, jpg, webp, bmp or tiff.
+- **Your colours**: it reads kitty's config, and `F2` edits the rest.
+
+## What it needs
+
+| what | why |
+|---|---|
+| Linux with X11 or XWayland | the window itself. Video drawn *inside* the window needs XWayland; without it mpv opens its own window and the bar is not there |
+| **mpv** | video. Without it peepin still shows pictures |
+| **ImageMagick** (`magick`) | everything `image` cannot read: heic, jxl, psd, svg, camera raw — see [Formats](#formats). GraphicsMagick (`gm`), `heif-convert`, `djxl` and `vips` work in its place |
+| Rust 1.85 or newer | to build it; the crate is edition 2024 |
+
+Nothing else to install for the window: X11, Wayland, xkb and OpenGL are loaded
+at run time, so no `-dev` packages are needed.
 
 ## Install
+
+```sh
+git clone https://github.com/madmedicnl/peepin
+cd peepin
+./install.sh
+```
+
+`install.sh` builds it and puts the binary in `~/.local/bin`, the icon in
+`~/.local/share/icons` and a menu entry in `~/.local/share/applications`; at the
+end it says which of the optional tools it found. `./install.sh --uninstall`
+removes those again. By hand it is two lines:
 
 ```sh
 cargo build --release
 install -m755 target/release/peepin ~/.local/bin/peepin
 ```
 
+The tools, on Arch:
+
+```sh
+sudo pacman -S --needed rust mpv imagemagick
+```
+
+on Debian or Ubuntu — with Rust from [rustup.rs](https://rustup.rs), since the
+distribution's cargo is usually older than edition 2024 needs:
+
+```sh
+sudo apt install mpv imagemagick
+```
+
 ## Open
 
 ```sh
-peepin                      # empty, Ctrl+O to pick
-peepin ~/Pictures/photo.jpg  # opens that file, ← → walk the folder
-peepin ~/Pictures            # opens the first image in the folder
+peepin                       # empty; Ctrl+O to pick a file
+peepin ~/Pictures/photo.jpg  # that file, and ← → walk its folder
+peepin ~/Pictures            # the first picture in the folder
 ```
 
 ## Keys
@@ -44,15 +104,13 @@ peepin ~/Pictures            # opens the first image in the folder
 | `l` (video) | load a subtitle file from the folder |
 | `Ctrl+Q` | quit |
 
-Videos (mp4, mkv, webm, avi, mov, …) are handed to **mpv**, which draws them
-inside peepin's own window, and loop; images go through `image` (png, jpg, gif,
-bmp, tga, tiff, webp, qoi, hdr, exr, ico, pnm) with `.dds` decoded through
-`image_dds` (BC1–BC7, Fallout's textures included).
-
 ## Video (mpv)
 
-The video gets a child window of peepin's own that stops just above the bottom
-edge, and the bar under it is peepin's to draw. That bar has, from the left:
+Videos are handed to **mpv**, which is told to draw into a window of peepin's
+own, so the video sits in peepin's window and not in one of its own. The bar
+under it is peepin's to draw:
+
+![the bar under a video](docs/video-bar.png)
 
 | in the bar | what |
 |---|---|
@@ -66,14 +124,15 @@ edge, and the bar under it is peepin's to draw. That bar has, from the left:
 | a number | the volume in percent |
 
 It all goes through mpv's IPC socket in `$XDG_RUNTIME_DIR` (removed with the
-video), which is also why mpv keeps no keyboard and no mouse of its own.
+video), which is also why mpv keeps no keyboard and no mouse of its own: every
+key still belongs to peepin.
 
 Subtitles come from the file itself when it has them — an MKV usually carries a
 few, and its first one is often already showing, because mpv picks one by its own
 language rules. The chip then reads that track's language (`FRA`, `NED`, `ENG`),
 `0`–`9` choose a track outright, and the right-click list names them all.
 
-While the list is open the video is out of the way, since it is a child window
+While that list is open the video is out of the way, since it is a child window
 that would be drawn over the list; it comes back as soon as the list closes.
 
 `srt` is for a subtitle that is a separate file next to the video; mpv loads one
@@ -81,23 +140,6 @@ with the video's exact name by itself, so `srt` is for the others.
 
 Without XWayland there is no window of ours to give mpv: the video then opens in
 a window of its own, the bar is not there, and the keys still work.
-
-## Mouse buttons
-
-`~/.config/peepin/peepin.conf`:
-
-```ini
-# prev or next — default is left = previous, right = next
-mouse.left = prev
-mouse.right = next
-```
-
-## Notes
-
-- The window is transparent: the picture sits on whatever is behind it. Under a
-  compositor that ignores alpha it will look black instead.
-- Zoom is relative to "fit", so `zoom 100%` means the picture exactly fills the
-  window; it re-fits when you resize.
 
 ## Formats
 
@@ -109,9 +151,10 @@ with `image`'s own DDS reader as the fallback for uncompressed surfaces.
 Read through a converter, the way IrfanView uses its plugins: **heic/heif, jxl,
 jp2/j2k, psd, pcx, xcf, wmf/emf, svg** and camera raw (**cr2, cr3, nef, arw, dng,
 orf, raf, rw2, pef, srw, 3fr, mrw**), plus **jxr/wdp/hdp**. These go through the
-first of `magick`, `heif-convert`, `djxl` or `vips` that is installed and succeeds,
-written to a temporary PNG and read back. Without those tools the formats simply
-report that they could not be read; the rest of the list does not depend on them.
+first of `magick`, `gm`, `heif-convert`, `djxl` or `vips` that is installed and
+succeeds, written to a temporary PNG and read back. Without those tools the
+formats simply report that they could not be read; the rest of the list does not
+depend on them.
 
 Read, as video (handed to mpv): **mp4, mkv, webm, avi, mov, m4v, wmv, flv, mpg,
 mpeg, ts, ogv**. mpv itself plays more, but these are the extensions peepin
@@ -176,10 +219,10 @@ works. Ctrl+S saves it; F3 or a new file closes it.
 ## Batch rename (F11)
 
 `{name}` is the old stem, `{n}` the number (zero-padded to the folder's count), and
-`start` is a field you type the first number into; the extension is kept. The panel previews the
-first twelve names, and *rename* renames the images in two passes, so a batch can
-never collide with itself. The folder is re-read afterwards and the picture you
-were looking at stays selected, so the arrows keep working.
+`start` is a field you type the first number into; the extension is kept. The
+panel previews the first twelve names, and *rename* renames the images in two
+passes, so a batch can never collide with itself. The folder is re-read afterwards
+and the picture you were looking at stays selected, so the arrows keep working.
 
 ## Picker (Ctrl+O)
 
@@ -198,7 +241,27 @@ does not appear under eframe's ui-based entry point).
 | `v` | thumbnails beside the names, or names only |
 | `Esc` | close |
 
-With `v` on, the right column shows a 96 × 72 thumbnail for every row, cover-cropped
-and cached per path. Only the rows on screen are decoded, and only a couple per
-frame, so a folder of three hundred large DDS files fills in as you look at it
-instead of freezing the window; a video, which has no still frame, shows `▶`.
+With `v` on, the right column shows a 96 × 72 thumbnail for every row,
+cover-cropped and cached per path. Only the rows on screen are decoded, and only
+a couple per frame, so a folder of three hundred large DDS files fills in as you
+look at it instead of freezing the window; a video, which has no still frame,
+shows `▶`.
+
+## Mouse buttons
+
+`~/.config/peepin/peepin.conf`:
+
+```ini
+# prev or next — default is left = previous, right = next
+mouse.left = prev
+mouse.right = next
+```
+
+## Notes
+
+- The window is transparent: the picture sits on whatever is behind it. Under a
+  compositor that ignores alpha it will look black instead.
+- Zoom is relative to "fit", so `zoom 100%` means the picture exactly fills the
+  window; it re-fits when you resize.
+- The icon is the one in `assets/peep.png`; `install.sh` puts it in the icon theme
+  and in a menu entry as well as on the window.

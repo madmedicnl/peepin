@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=peepin
+GenericName=Image and video viewer
+Comment=A tiny image and video viewer with a terminal feel
+Exec=peepin %f
+Icon=peepin
+Terminal=false
+Categories=Graphics;Viewer;
+Keywords=image;photo;picture;viewer;video;texture;dds;
+MimeType=image/png;image/jpeg;image/gif;image/bmp;image/tiff;image/webp;image/avif;image/x-dds;video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;
+StartupWMClass=peepin
+StartupNotify=true
