@@ -298,18 +298,30 @@ enum Overlay {
     Rename(RenameDialog),
 }
 
+/// One subtitle track of the file: an embedded one, or one peepin loaded.
+#[derive(Clone, Default)]
+struct SubTrack {
+    id: i64,
+    lang: String,
+    title: String,
+}
+
 /// What mpv last told us about the video on screen.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct VideoState {
     pos: f64,
     duration: f64,
     volume: f64,
     paused: bool,
     muted: bool,
-    /// Whether a subtitle track is selected (mpv says `sid` is `no` when not).
-    has_subs: bool,
+    /// The selected subtitle track, when one is chosen.
+    sid: Option<i64>,
     /// Whether mpv would show it.
     subs: bool,
+    /// The subtitle tracks the file has, read once when playback starts.
+    tracks: Vec<SubTrack>,
+    /// Set when a track was added, so the list is read again.
+    tracks_stale: bool,
 }
 
 /// A child window of our own that mpv is told to paint into with `--wid`.
@@ -522,7 +534,52 @@ impl VideoState {
         // `sid` is a number when a subtitle is selected, and `false` or `no`
         // when there is none.
         if let Some(v) = mpv_get(socket, "sid") {
-            self.has_subs = v.parse::<f64>().is_ok();
+            self.sid = v.parse::<f64>().ok().map(|n| n as i64);
+        }
+        if self.tracks.is_empty() || self.tracks_stale {
+            self.read_tracks(socket);
+        }
+    }
+
+    /// The subtitle tracks of the file, as mpv lists them.
+    fn read_tracks(&mut self, socket: &Path) {
+        let Some(count) = mpv_number(socket, "track-list/count") else {
+            return;
+        };
+        let mut tracks = Vec::new();
+        for i in 0..count as u32 {
+            let Some(kind) = mpv_get(socket, &format!("track-list/{i}/type")) else {
+                continue;
+            };
+            if kind != "sub" {
+                continue;
+            }
+            let Some(id) = mpv_number(socket, &format!("track-list/{i}/id")) else {
+                continue;
+            };
+            tracks.push(SubTrack {
+                id: id as i64,
+                lang: mpv_get(socket, &format!("track-list/{i}/lang")).unwrap_or_default(),
+                title: mpv_get(socket, &format!("track-list/{i}/title")).unwrap_or_default(),
+            });
+        }
+        self.tracks = tracks;
+        self.tracks_stale = false;
+    }
+
+    /// The track that is showing, if any.
+    fn selected(&self) -> Option<&SubTrack> {
+        let sid = self.sid?;
+        self.tracks.iter().find(|t| t.id == sid)
+    }
+
+    /// What the subtitle chip says: the language of the track, or `sub`.
+    fn label(&self) -> String {
+        match self.selected() {
+            Some(track) if !track.lang.is_empty() => track.lang.to_uppercase(),
+            Some(track) if !track.title.is_empty() => shorten(&track.title, 4).to_uppercase(),
+            Some(track) => format!("s{}", track.id),
+            None => "sub".to_string(),
         }
     }
 }
@@ -579,6 +636,13 @@ struct Peepin {
     seek_at_start: Option<f64>,
     /// `--sub-load`: load the subtitle beside the video once it is running.
     sub_load_at_start: bool,
+    /// `--sub-cycle=N`: walk through the subtitle tracks N times, as the chip
+    /// would, with a moment between each.
+    sub_cycle_at_start: usize,
+    /// When the last of those steps was taken.
+    sub_cycle_at: Option<Instant>,
+    /// `--sub-pick=N`: choose subtitle track N once, as the number keys do.
+    sub_pick_at_start: Option<usize>,
     /// A video waiting for the window to be mapped.
     pending_video: Option<PathBuf>,
     palette: Palette,
@@ -660,6 +724,9 @@ impl Peepin {
             seek_sent: None,
             seek_at_start: None,
             sub_load_at_start: false,
+            sub_cycle_at_start: 0,
+            sub_cycle_at: None,
+            sub_pick_at_start: None,
             pending_video: None,
             palette,
             background: Background::Transparent,
@@ -1328,6 +1395,50 @@ impl Peepin {
         self.mpv_command(&["set_property", "volume", &value]);
     }
 
+    /// Show track `id`, or none at all.
+    fn select_sub(&mut self, id: Option<i64>) {
+        match id {
+            Some(id) => {
+                self.mpv_command(&["set_property", "sid", &id.to_string()]);
+                self.mpv_command(&["set_property", "sub-visibility", "yes"]);
+                self.mpv.sid = Some(id);
+                self.mpv.subs = true;
+            }
+            None => {
+                self.mpv_command(&["set_property", "sid", "no"]);
+                self.mpv.sid = None;
+            }
+        }
+    }
+
+    /// The next subtitle track, and off after the last one. With no track in the
+    /// file at all, it is the visibility that toggles.
+    fn cycle_subs(&mut self) {
+        if self.mpv.tracks.is_empty() {
+            self.toggle_subs();
+            return;
+        }
+        let ids: Vec<i64> = self.mpv.tracks.iter().map(|t| t.id).collect();
+        let next = match self.mpv.sid {
+            None => ids.first().copied(),
+            Some(current) => match ids.iter().position(|id| *id == current) {
+                Some(i) if i + 1 < ids.len() => ids.get(i + 1).copied(),
+                _ => None,
+            },
+        };
+        self.select_sub(next);
+    }
+
+    /// Track by its place in the file: 0 is off, 1 is the first.
+    fn pick_sub(&mut self, number: usize) {
+        if number == 0 {
+            self.select_sub(None);
+            return;
+        }
+        let id = self.mpv.tracks.get(number - 1).map(|t| t.id);
+        self.select_sub(id);
+    }
+
     fn toggle_subs(&mut self) {
         let on = !self.mpv.subs;
         self.mpv.subs = on;
@@ -1363,6 +1474,7 @@ impl Peepin {
                 self.mpv_command(&["sub-add", &text, "select"]);
                 self.mpv_command(&["set_property", "sub-visibility", "yes"]);
                 self.mpv.subs = true;
+                self.mpv.tracks_stale = true;
                 self.status = format!(
                     "subs: {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
@@ -1414,6 +1526,23 @@ impl Peepin {
             self.sub_load_at_start = false;
             self.load_subtitle();
         }
+        if let Some(number) = self.sub_pick_at_start {
+            if !self.mpv.tracks.is_empty() && self.mpv.duration > 0.0 {
+                self.sub_pick_at_start = None;
+                self.pick_sub(number);
+            }
+        }
+        if self.sub_cycle_at_start > 0 && !self.mpv.tracks.is_empty() && self.mpv.duration > 0.0 {
+            let due = self
+                .sub_cycle_at
+                .map(|t| t.elapsed() > Duration::from_millis(900))
+                .unwrap_or(true);
+            if due {
+                self.sub_cycle_at = Some(Instant::now());
+                self.sub_cycle_at_start -= 1;
+                self.cycle_subs();
+            }
+        }
     }
 
     /// The keys that belong to a playing video.
@@ -1444,10 +1573,35 @@ impl Peepin {
             self.mpv.muted = !self.mpv.muted;
         }
         if subs {
-            self.toggle_subs();
+            self.cycle_subs();
         }
         if load {
             self.load_subtitle();
+        }
+        // 1-9 pick a subtitle track straight away, 0 turns them off.
+        let digit = ctx.input(|i| {
+            if i.modifiers.command || i.modifiers.ctrl {
+                return None;
+            }
+            [
+                egui::Key::Num0,
+                egui::Key::Num1,
+                egui::Key::Num2,
+                egui::Key::Num3,
+                egui::Key::Num4,
+                egui::Key::Num5,
+                egui::Key::Num6,
+                egui::Key::Num7,
+                egui::Key::Num8,
+                egui::Key::Num9,
+            ]
+            .iter()
+            .position(|key| i.key_pressed(*key))
+        });
+        if let Some(number) = digit {
+            if !self.mpv.tracks.is_empty() {
+                self.pick_sub(number);
+            }
         }
     }
 
@@ -1475,7 +1629,7 @@ impl Peepin {
             )
         };
         let load = chip_at(bar.right() - pad, 30.0);
-        let subs = chip_at(load.left() - 5.0, 24.0);
+        let subs = chip_at(load.left() - 5.0, 30.0);
         let mute = chip_at(subs.left() - 5.0, 24.0);
         let pause = chip_at(mute.left() - 5.0, 24.0);
         let vol_number = Rect::from_min_size(
@@ -1540,7 +1694,8 @@ impl Peepin {
         // Chips: pause, mute, subtitles, load subtitles.
         paint_chip(ui, pause, if self.mpv.paused { "▶" } else { "||" }, false, palette);
         paint_chip(ui, mute, "m", self.mpv.muted, palette);
-        paint_chip(ui, subs, "sub", self.mpv.subs && self.mpv.has_subs, palette);
+        let subs_label = self.mpv.label();
+        paint_chip(ui, subs, &subs_label, self.mpv.subs && self.mpv.sid.is_some(), palette);
         paint_chip(ui, load, "srt", false, palette);
 
         let pause_hit = ui.interact(pause, egui::Id::new("video-pause"), egui::Sense::click());
@@ -1553,9 +1708,11 @@ impl Peepin {
             self.mpv_command(&["cycle", "mute"]);
             self.mpv.muted = !self.mpv.muted;
         }
-        let subs_hit = ui.interact(subs, egui::Id::new("video-subs"), egui::Sense::click());
+        let subs_hit = ui
+            .interact(subs, egui::Id::new("video-subs"), egui::Sense::click())
+            .on_hover_text(subtitle_hint(&self.mpv));
         if subs_hit.clicked() {
-            self.toggle_subs();
+            self.cycle_subs();
         }
         let load_hit = ui.interact(load, egui::Id::new("video-load"), egui::Sense::click());
         if load_hit.clicked() {
@@ -2248,7 +2405,8 @@ const KEYS: &[(&str, &str)] = &[
     ("b", "background: clear, blur, solid"),
     ("space (video)", "pause"),
     ("↑ ↓ (video)", "volume"),
-    ("m / s (video)", "mute / subtitles off and on"),
+    ("m / s (video)", "mute / next subtitle track"),
+    ("0-9 (video)", "subtitle track, 0 is off"),
     ("srt (video)", "load a subtitle from this folder"),
     ("ctrl+o", "open: folders left, files right"),
     ("v in the picker", "thumbnails beside the names"),
@@ -2312,6 +2470,33 @@ fn thumbnail(image: &egui::ColorImage, w: u32, h: u32) -> egui::ColorImage {
     let cropped =
         image::imageops::crop_imm(&scaled, (sw - w) / 2, (sh - h) / 2, w, h).to_image();
     egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], cropped.as_raw())
+}
+
+/// What the subtitle chip would do, and which tracks there are.
+fn subtitle_hint(state: &VideoState) -> String {
+    if state.tracks.is_empty() {
+        return "no subtitle track in this file — srt loads one from the folder".to_string();
+    }
+    let mut text = String::from("subtitle tracks:\n");
+    for (i, track) in state.tracks.iter().enumerate() {
+        let mut name = String::new();
+        if !track.lang.is_empty() {
+            name.push_str(&track.lang);
+        }
+        if !track.title.is_empty() {
+            if !name.is_empty() {
+                name.push_str(" — ");
+            }
+            name.push_str(&track.title);
+        }
+        if name.is_empty() {
+            name = format!("track {}", track.id);
+        }
+        let mark = if state.sid == Some(track.id) { "●" } else { "○" };
+        text.push_str(&format!("  {mark} {} {name}\n", i + 1));
+    }
+    text.push_str("1-9 pick one, 0 off, click: next one");
+    text
 }
 
 /// A thin bar with a filled part: the seek position and the volume.
@@ -3237,6 +3422,16 @@ fn main() -> eframe::Result<()> {
             }
             if std::env::args().any(|a| a == "--sub-load") {
                 app.sub_load_at_start = true;
+            }
+            if let Some(steps) = std::env::args()
+                .find_map(|a| a.strip_prefix("--sub-cycle=").and_then(|v| v.parse::<usize>().ok()))
+            {
+                app.sub_cycle_at_start = steps;
+            }
+            if let Some(number) = std::env::args()
+                .find_map(|a| a.strip_prefix("--sub-pick=").and_then(|v| v.parse::<usize>().ok()))
+            {
+                app.sub_pick_at_start = Some(number);
             }
             if save_at_start {
                 app.open_save();

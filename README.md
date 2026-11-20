@@ -39,8 +39,9 @@ peepin ~/Pictures            # opens the first image in the folder
 | `space` (video) | pause / play |
 | `↑` `↓` (video) | volume |
 | `m` (video) | mute |
-| `s` (video) | subtitles off / on |
-| `l` (video) | load a subtitle from the folder |
+| `s` (video) | next subtitle track, off after the last |
+| `0`–`9` (video) | subtitle track by number, `0` is off |
+| `l` (video) | load a subtitle file from the folder |
 | `Ctrl+Q` | quit |
 
 Videos (mp4, mkv, webm, avi, mov, …) are handed to **mpv**, which draws them
@@ -59,15 +60,20 @@ edge, and the bar under it is peepin's to draw. That bar has, from the left:
 | the seek bar | drag or click to jump; the clock is on its right |
 | `\|\|` / `▶` | pause and play (`space`) |
 | `m` | mute, lit while muted |
-| `sub` | subtitles off and on, lit while they show |
-| `srt` | load a subtitle from this folder: the one named after the video if there is one, else the first `.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`, `.idx`, `.sup` |
+| `sub`, or `FRA` | the subtitle track. When one is showing, the label is its language; a click walks to the next track and off after the last, and hovering lists every track with its number |
+| `srt` | load a subtitle file from this folder: the one named after the video if there is one, else the first `.srt`, `.vtt`, `.ass`, `.ssa`, `.sub`, `.idx`, `.sup` |
 | the volume bar | drag or click; the wheel over the bar does it too, and `↑` `↓`; 100 is mpv's normal level, up to 130 |
 | a number | the volume in percent |
 
 It all goes through mpv's IPC socket in `$XDG_RUNTIME_DIR` (removed with the
-video), which is also why mpv keeps no keyboard and no mouse of its own. mpv
-already loads a subtitle with the video's exact name; `srt` is for the ones named
-differently.
+video), which is also why mpv keeps no keyboard and no mouse of its own.
+
+Subtitles come from the file itself when it has them — an MKV usually carries a
+few, and its first one is often already showing, because mpv picks one by its own
+language rules. The chip then reads that track's language (`FRA`, `NED`, `ENG`),
+and `0`–`9` choose a track outright while the numbers are in the hover text.
+`srt` is for a subtitle that is a separate file next to the video; mpv loads one
+with the video's exact name by itself, so `srt` is for the others.
 
 Without XWayland there is no window of ours to give mpv: the video then opens in
 a window of its own, the bar is not there, and the keys still work.
