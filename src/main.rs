@@ -285,6 +285,15 @@ struct SaveDialog {
     note: String,
 }
 
+/// A multi-frame file playing on screen: the frames, where it is, and the clock
+/// that says when the next one is due.
+struct Animation {
+    frames: Vec<(egui::ColorImage, std::time::Duration)>,
+    index: usize,
+    elapsed: std::time::Duration,
+    paused: bool,
+}
+
 /// F3: the contact sheet, already rendered as a picture so Ctrl+S can save it.
 struct Sheet {
     texture: egui::TextureHandle,
@@ -905,6 +914,8 @@ struct Peepin {
     files: Vec<PathBuf>,
     index: usize,
     texture: Option<egui::TextureHandle>,
+    /// Set for a multi-frame file; `None` for a still picture.
+    animation: Option<Animation>,
     image_size: Vec2,
     zoom: f32,
     pan: Vec2,
@@ -1051,6 +1062,7 @@ impl Peepin {
             files,
             index,
             texture: None,
+            animation: None,
             image_size: Vec2::ZERO,
             zoom: 1.0,
             pan: Vec2::ZERO,
@@ -2349,10 +2361,60 @@ impl Peepin {
         self.load(ctx);
     }
 
+    /// Play a multi-frame picture: swap the texture when the frame's time
+    /// comes, and ask for the repaint at the frame's own delay rather than at
+    /// the video rate.
+    fn tick_animation(&mut self, ctx: &egui::Context) {
+        const MIN_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+        let (index, elapsed, changed, delay) = {
+            let Some(animation) = self.animation.as_ref() else {
+                return;
+            };
+            if animation.paused || animation.frames.len() < 2 {
+                return;
+            }
+            let dt = std::time::Duration::from_secs_f32(ctx.input(|i| i.stable_dt).min(0.25));
+            let mut index = animation.index;
+            let mut elapsed = animation.elapsed + dt;
+            let mut changed = false;
+            loop {
+                let at = animation.frames[index].1.max(MIN_DELAY);
+                if elapsed < at {
+                    break;
+                }
+                elapsed -= at;
+                index = (index + 1) % animation.frames.len();
+                changed = true;
+            }
+            (index, elapsed, changed, animation.frames[index].1)
+        };
+
+        if let Some(animation) = self.animation.as_mut() {
+            animation.index = index;
+            animation.elapsed = elapsed;
+        }
+        if changed && let Some(image) = self.animation.as_ref().map(|a| a.frames[index].0.clone()) {
+            if let Some(texture) = self.texture.as_mut() {
+                texture.set(image.clone(), egui::TextureOptions::LINEAR);
+            }
+            // The blurred background is a 48-pixel-downscale of the picture, so
+            // it costs nothing to keep it on the frame that is on screen; left
+            // on the first frame it was a wash of one colour behind another.
+            if matches!(self.background, Background::Blur)
+                && let Some(blur) = self.blur.as_mut()
+            {
+                blur.set(blur_version(&image), egui::TextureOptions::LINEAR);
+            }
+        }
+        ctx.request_repaint_after(delay.max(MIN_DELAY));
+    }
+
     fn load(&mut self, ctx: &egui::Context) {
         self.stop_video();
         self.sheet = None;
         self.texture = None;
+        self.animation = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
 
@@ -2376,14 +2438,28 @@ impl Peepin {
                 self.source = Some(image.clone());
                 let size = Vec2::new(image.width() as f32, image.height() as f32);
                 self.image_size = size;
+                // A multi-frame file plays: its first frame is the picture now,
+                // the rest follow on their own clock (`tick_animation`).
+                let mut shown = image;
+                let mut frames_note = String::new();
+                if let Some(frames) = load_animation(&path) {
+                    shown = frames[0].0.clone();
+                    frames_note = format!("  {} frames", frames.len());
+                    self.animation = Some(Animation {
+                        frames,
+                        index: 0,
+                        elapsed: std::time::Duration::ZERO,
+                        paused: false,
+                    });
+                }
                 self.blur = Some(ctx.load_texture(
                     "peepin-blur",
-                    blur_version(&image),
+                    blur_version(&shown),
                     egui::TextureOptions::LINEAR,
                 ));
                 self.texture =
-                    Some(ctx.load_texture("peepin", image, egui::TextureOptions::LINEAR));
-                self.status = format!("{name}  {}x{}", size.x as u32, size.y as u32);
+                    Some(ctx.load_texture("peepin", shown, egui::TextureOptions::LINEAR));
+                self.status = format!("{name}  {}x{}{frames_note}", size.x as u32, size.y as u32);
             }
             Err(err) => {
                 self.blur = None;
@@ -3591,6 +3667,9 @@ impl eframe::App for Peepin {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
+        // A picture that moves keeps its own clock, whether or not anything
+        // else on screen is asking for frames.
+        self.tick_animation(ctx);
 
         // A contact sheet built in the background lands here when it is ready.
         if let Some(rx) = self.sheet_job.as_ref() {
@@ -3698,6 +3777,14 @@ impl eframe::App for Peepin {
             // volume, and the bar's own keys live in `video_keys`.
             self.video_keys(ctx);
         } else {
+            // Space is the video's pause; on a picture it pauses a moving one,
+            // and says so on the same bar.
+            let space = ctx.input(|i| {
+                !(i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::Space)
+            });
+            if space && let Some(animation) = self.animation.as_mut() {
+                animation.paused = !animation.paused;
+            }
             if up {
                 self.zoom_by(1.25);
             }
@@ -4104,6 +4191,33 @@ fn decode_with_tool(path: &Path) -> Option<egui::ColorImage> {
         let _ = std::fs::remove_file(&out);
     }
     None
+}
+
+/// The frames of a GIF, in order, with their own delays — `None` for a still
+/// picture or a one-frame GIF, which `load_image` already handles.
+fn load_animation(path: &Path) -> Option<Vec<(egui::ColorImage, std::time::Duration)>> {
+    use image::AnimationDecoder as _;
+
+    if !has_ext(path, &["gif"]) {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)).ok()?;
+    let decoded = decoder.into_frames().collect_frames().ok()?;
+    if decoded.len() < 2 {
+        return None;
+    }
+    let mut frames = Vec::with_capacity(decoded.len());
+    for frame in decoded {
+        let delay: std::time::Duration = frame.delay().into();
+        let buffer = frame.into_buffer();
+        let size = [buffer.width() as usize, buffer.height() as usize];
+        frames.push((
+            egui::ColorImage::from_rgba_unmultiplied(size, buffer.as_raw()),
+            delay,
+        ));
+    }
+    Some(frames)
 }
 
 fn load_image(path: &Path) -> Result<egui::ColorImage, String> {
