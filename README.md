@@ -44,6 +44,17 @@ at run time, so no `-dev` packages are needed.
 
 ## Install
 
+The quickest way is the AppImage from the
+[latest release](https://github.com/madmedicnl/peepin/releases): one file, no
+install, nothing to unpack.
+
+```sh
+chmod +x peepin-*-x86_64.AppImage
+./peepin-*-x86_64.AppImage ~/Pictures
+```
+
+Or build it from source:
+
 ```sh
 git clone https://github.com/madmedicnl/peepin
 cd peepin
@@ -73,7 +84,7 @@ distribution's cargo is usually older than edition 2024 needs:
 sudo apt install mpv imagemagick
 ```
 
-A built `peepin-git` package is attached to the
+An Arch package (`peepin-git`) is attached to the
 [latest release](https://github.com/madmedicnl/peepin/releases) — download it and
 `sudo pacman -U peepin-git-*.pkg.tar.zst`. Or build it yourself from the
 `PKGBUILD` in `packaging/`; `packaging/README.md` says how:

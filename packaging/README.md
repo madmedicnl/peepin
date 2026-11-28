@@ -5,6 +5,21 @@ git, the crates with `cargo fetch`, and the package holds the binary, the menu
 entry, the icon and the licence. `.SRCINFO` is generated from it and has to
 travel with it — the AUR reads that file, not the PKGBUILD.
 
+## AppImage
+
+`appimage.sh` builds the release AppImage — one file, no install — into
+`dist/`:
+
+```sh
+./packaging/appimage.sh              # build, then dist/peepin-<version>-x86_64.AppImage
+./packaging/appimage.sh --no-build   # reuse the binary already in target/
+```
+
+The version comes from `Cargo.toml`, and the script proves the file runs
+(`--appimage-extract-and-run`, then `--version`) before it says it is built.
+Nothing is bundled beside the binary: X11, Wayland, the GL stack and GLIBC are
+the host's, and mpv and ImageMagick stay optional tools peepin looks for.
+
 ## Build and install the package here
 
 ```sh
